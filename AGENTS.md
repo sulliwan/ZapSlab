@@ -28,6 +28,8 @@ src/                 root crate `zapslab` (gpui view + platform glue)
                      one-step replace-all)
   storage.rs         IndexedDB document + localStorage recent list
                      (wasm-only + non-wasm stub)
+  version.rs         app name/version + page -> app "new build" notification
+                     bridge (wasm-only + non-wasm stub)
   transforms/        pure transform registry (mod.rs + category submodules;
                      each entry has name/tags/scope + fn(&str) -> TransformResult)
 crates/document/     standalone crate `zapslab-document` (pure model + tests)
@@ -40,7 +42,7 @@ crates/document/     standalone crate `zapslab-document` (pure model + tests)
   escape.rs          invisible-character escaping
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
-                     + zapslab-icon-64.png (icon source artwork)
+                     + zapslab-icon-64.png (icon source artwork), bump_version.py
 docker/Dockerfile    pinned builder image (Rust + wasm32 + wasm-bindgen + binaryen)
 docker/Dockerfile.deploy  Node + wrangler image for Cloudflare Pages deploys
 Makefile             containerized entry points for every cargo/rust command
@@ -78,6 +80,7 @@ make deploy-login # log in to Cloudflare (OAuth device flow)
 make deploy-image # build the wrangler deployment image
 make shell       # interactive shell in the builder image
 make icons       # render PWA icons from the source artwork (host python3 + pillow)
+make bump_version major|minor|revision  # bump [package].version in Cargo.toml (host python3)
 make vendor-wgpu # materialize the patched wgpu source
 make clean       # remove target/, dist/, .cache/
 ```
@@ -245,6 +248,28 @@ keep the public signatures identical across both.
 - Writes are debounced (500 ms; 2 s above 4 MB, where copying/writing is
   expensive). Copy the text only after the debounce fires, never on every
   keystroke, and never block typing on storage.
+
+### Versioning and update detection
+
+`make bump_version major|minor|revision` bumps the root `[package].version` in
+`Cargo.toml`; that number is display-only. `scripts/build_web.sh` additionally
+stamps every deploy with a content hash of the final wasm binary, which:
+
+- names `dist/zapslab_bg.<hash>.wasm` (wasm-bindgen's glue is rewritten to
+  match), so the `immutable` `.wasm` header never pins a stale binary;
+- names the service-worker cache (`zapslab-<hash>`), so a deploy purges the
+  previous shell on activate;
+- is written to `dist/version.json` (`{name, version, build}`) and injected into
+  `dist/index.html`'s `<meta name="zapslab-build">` and `dist/sw.js`.
+
+`web/index.html` compares the deployed `build` from `/version.json` (served
+network-first, `no-store`) against the id the page booted with on `focus` and
+`visibilitychange`, then posts `{type:"zapslab-update-available"}` to the window.
+`src/version.rs` bridges that message into the view (`async-channel` into a gpui
+task); the palette header shows the app name/version plus a "New version" button,
+and the reload confirmation saves the document before reloading. Detection keys
+off the build id, not the semantic version, so re-releasing the same version
+with a different binary is still detected.
 
 ## Coding principles and patterns
 

@@ -521,3 +521,120 @@ impl Scratchpad {
         pending_overlay.map(|element| element.into_any_element())
     }
 }
+
+impl Scratchpad {
+    /// Confirmation shown after the user accepts an available update. Reloading
+    /// discards in-memory state, so it always asks first.
+    pub(crate) fn reload_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.pending_reload {
+            return None;
+        }
+        let detail = match self
+            .update_available
+            .as_ref()
+            .and_then(|info| info.version.clone())
+        {
+            Some(version) => format!("Version {version} is ready. Reload now to use it?"),
+            None => "A new version is ready. Reload now to use it?".to_string(),
+        };
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        // Clicking the dimmed backdrop cancels, like Esc.
+                        this.cancel_reload(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(440.0))
+                        .p(px(12.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        // Keep clicks on the dialog from bubbling to the backdrop.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(div().text_color(rgb(0xf5e0dc)).child("Update available"))
+                        .child(div().mt(px(6.0)).text_color(rgb(0xcdd6f4)).child(detail))
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.cancel_reload(window, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x11111b))
+                                        .bg(rgb(0x94e2d5))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.confirm_reload(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child("Reload"),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Saves the document, then reloads so the service worker serves the newly
+    /// deployed build. The save is best-effort: the user asked to update, so a
+    /// failed write still reloads (the in-memory text is lost either way).
+    pub(crate) fn confirm_reload(&mut self, cx: &mut Context<Self>) {
+        self.pending_reload = false;
+        let text = self.document.text_with_line_endings().into_owned();
+        self._reload_task = Some(cx.spawn(async move |_this, _cx| {
+            let _ = crate::storage::save(&text).await;
+            crate::version::reload();
+        }));
+    }
+
+    /// Dismisses the reload confirmation and returns input to the palette.
+    pub(crate) fn cancel_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_reload = false;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+}

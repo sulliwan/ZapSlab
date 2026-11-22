@@ -332,6 +332,24 @@ impl Scratchpad {
                 items.push(item.into_any_element());
             }
 
+            // Offered only when the page reported a newer deployed build. The
+            // palette stays open behind the confirmation overlay.
+            let update_button = self.update_available.is_some().then(|| {
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .text_color(rgb(0x11111b))
+                    .bg(rgb(0xf9e2af))
+                    .child("New version")
+                    .id("zapslab-palette-update")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.pending_reload = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+            });
+
             div()
                 .absolute()
                 .top_0()
@@ -371,6 +389,25 @@ impl Scratchpad {
                             cx.listener(|_this, _event, _window, cx| {
                                 cx.stop_propagation();
                             }),
+                        )
+                        // App name and version sit above the query, matching the
+                        // requested "above the palette menu" placement.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px(px(8.0))
+                                .pb(px(4.0))
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x6c7086))
+                                .child(format!(
+                                    "{} {}",
+                                    crate::version::APP_NAME,
+                                    crate::version::APP_VERSION
+                                ))
+                                .children(update_button),
                         )
                         .child(
                             div()
