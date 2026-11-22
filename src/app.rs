@@ -27,7 +27,8 @@ use zapslab_document::{
     utf16_offset,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
+    AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, ElementInputHandler,
+    EntityInputHandler,
     FocusHandle, FontId, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, StyledText, Subscription, Task, UTF16Selection,
@@ -51,6 +52,8 @@ const LINE_HEIGHT_RATIO: f32 = 1.618;
 const FALLBACK_ASCII_WIDTH_PX: f32 = 8.0;
 /// localStorage writes are synchronous; coalesce bursts of typing into one write.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Keep the recently-used list short enough to scan at a glance.
+const RECENT_TRANSFORMS_MAX: usize = 8;
 /// How long a transient status-bar hint stays visible.
 const HINT_DURATION: Duration = Duration::from_millis(1800);
 /// Default hex panel width as a fraction of the viewport.
@@ -74,6 +77,25 @@ struct Metrics {
 struct Palette {
     query: String,
     selected: usize,
+}
+
+/// Floating palette description, shown by gpui's tooltip machinery when the
+/// pointer rests on a row's info icon.
+struct PaletteTooltip {
+    text: &'static str,
+}
+
+impl Render for PaletteTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .bg(rgb(0x313244))
+            .text_color(rgb(0xcdd6f4))
+            .text_size(px(12.0))
+            .child(self.text)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -166,9 +188,12 @@ pub struct Scratchpad {
     caret_visible: bool,
     word_wrap: bool,
     palette: Option<Palette>,
-    /// Transform index whose description is currently shown (hover on the
-    /// palette's info icon).
-    palette_hover: Option<usize>,
+    /// Scroll position of the transform list. Reset when the palette opens or
+    /// the query changes; driven by the wheel/trackpad and arrow navigation.
+    palette_scroll: ScrollHandle,
+    /// Recently applied transform names, newest first. Persisted in
+    /// localStorage and used to float them to the top of the empty palette.
+    recent_transforms: Vec<String>,
     /// Render non-printing/invisible characters as colored escape sequences.
     /// On by default: the buffer is often inspected as near-binary data.
     show_invisibles: bool,
@@ -238,7 +263,8 @@ impl Scratchpad {
             caret_visible: true,
             word_wrap: true,
             palette: None,
-            palette_hover: None,
+            palette_scroll: ScrollHandle::default(),
+            recent_transforms: storage::load_recent(),
             show_invisibles: true,
             hex_panel: false,
             hex_encoding: Encoding::Utf8,
@@ -482,9 +508,33 @@ impl Scratchpad {
         insert: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.document.replace_range(start, end, insert) {
             self.after_edit(window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces `start..end` and, when `keep_selection` is set, re-selects the
+    /// inserted output so a transform leaves its result highlighted.
+    fn replace_range_keeping_selection(
+        &mut self,
+        start: usize,
+        end: usize,
+        insert: &str,
+        keep_selection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.replace_range(start, end, insert, window, cx);
+        if keep_selection {
+            // A no-op replace leaves the cursor alone; otherwise the document
+            // parks it at the end of the (newline-normalized) inserted text.
+            let new_end = if changed { self.document.cursor() } else { end };
+            self.document.select_range(start, new_end);
+            cx.notify();
         }
     }
 
@@ -723,6 +773,8 @@ impl Scratchpad {
                     palette.query.pop();
                     palette.selected = 0;
                 }
+                // A changed query re-ranks the list; show it from the top.
+                self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
                 cx.notify();
             }
             "left" | "right" | "home" | "end" | "tab" | "delete" => {}
@@ -745,7 +797,7 @@ impl Scratchpad {
         // whole document (Boop's `state.text`), and selection-only entries are
         // greyed out in the list instead.
         self.palette = Some(Palette::default());
-        self.palette_hover = None;
+        self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         self.dragging = false;
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
@@ -764,23 +816,15 @@ impl Scratchpad {
         cx.notify();
     }
 
+    /// Palette entries matching the query, best match first. Recently used
+    /// transforms lead when the query is empty.
     fn palette_matches(&self) -> Vec<usize> {
         let query = self
             .palette
             .as_ref()
-            .map(|palette| palette.query.to_lowercase())
-            .unwrap_or_default();
-        transforms::TRANSFORMS
-            .iter()
-            .enumerate()
-            .filter(|(_, transform)| {
-                query.is_empty()
-                    || transform.name.to_lowercase().contains(&query)
-                    || transform.tags.to_lowercase().contains(&query)
-                    || transform.description.to_lowercase().contains(&query)
-            })
-            .map(|(index, _)| index)
-            .collect()
+            .map(|palette| palette.query.as_str())
+            .unwrap_or("");
+        transforms::search(query, &self.recent_transforms)
     }
 
     fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -791,7 +835,10 @@ impl Scratchpad {
         let (sel_start, sel_end) = self.document.selection_range();
         let has_selection = sel_start != sel_end;
         let len = matches.len() as isize;
-        if let Some(palette) = &mut self.palette {
+        let selected = {
+            let Some(palette) = &mut self.palette else {
+                return;
+            };
             let mut current = palette.selected.min(matches.len() - 1) as isize;
             // Skip entries that cannot run (selection-only with no selection).
             // Bounded by `len` so an all-unavailable list never spins.
@@ -803,8 +850,11 @@ impl Scratchpad {
                 }
             }
             palette.selected = current as usize;
-            cx.notify();
-        }
+            palette.selected
+        };
+        // Keep the highlighted entry visible while arrowing through the list.
+        self.palette_scroll.scroll_to_item(selected);
+        cx.notify();
     }
 
     fn apply_selected_transform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -823,6 +873,8 @@ impl Scratchpad {
             return;
         }
 
+        self.record_recent_transform(transform.name);
+
         // Resolve the read/write range from the transform's scope. Boop's
         // `state.text` is the selection when one exists, else the whole buffer.
         let (start, end) = match transform.scope {
@@ -839,13 +891,26 @@ impl Scratchpad {
 
         let result = (transform.apply)(&self.document.text()[start..end]);
         self.palette = None;
-        self.palette_hover = None;
         match result {
             transforms::TransformResult::Replace(text) => {
-                self.replace_range(start, end, &text, window, cx);
+                self.replace_range_keeping_selection(
+                    start,
+                    end,
+                    &text,
+                    has_selection,
+                    window,
+                    cx,
+                );
             }
             transforms::TransformResult::ReplaceAndReport { text, message } => {
-                self.replace_range(start, end, &text, window, cx);
+                self.replace_range_keeping_selection(
+                    start,
+                    end,
+                    &text,
+                    has_selection,
+                    window,
+                    cx,
+                );
                 self.show_hint(message, cx);
             }
             transforms::TransformResult::Report(message) => {
@@ -858,12 +923,23 @@ impl Scratchpad {
         cx.notify();
     }
 
+    /// Promotes `name` to the front of the recently-used list and persists it.
+    /// Persistence is a convenience; a failed write is intentionally ignored so
+    /// it cannot disrupt the edit.
+    fn record_recent_transform(&mut self, name: &'static str) {
+        self.recent_transforms.retain(|recent| recent != name);
+        self.recent_transforms.insert(0, name.to_string());
+        self.recent_transforms.truncate(RECENT_TRANSFORMS_MAX);
+        let _ = storage::save_recent(&self.recent_transforms);
+    }
+
     #[allow(dead_code)] // used by the native key path
     fn push_palette_query(&mut self, text: &str) {
         if let Some(palette) = &mut self.palette {
             palette.query.push_str(text);
             palette.selected = 0;
         }
+        self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     fn update_scroll_drag(
@@ -1640,6 +1716,7 @@ impl EntityInputHandler for Scratchpad {
             let end = end.min(len).max(start);
             palette.query.replace_range(start..end, text);
             palette.selected = 0;
+            self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
             window.notify_text_input_changed(&self.focus_handle);
             cx.notify();
             return;
@@ -2033,6 +2110,9 @@ impl Render for Scratchpad {
             let matches = self.palette_matches();
             let (sel_start, sel_end) = self.document.selection_range();
             let has_selection = sel_start != sel_end;
+            // Leave room for the 80px top offset, the query line, and padding
+            // so the list never extends past the window.
+            let list_max_height = (f32::from(viewport.height) - 80.0 - 56.0).max(120.0);
             let mut items: Vec<AnyElement> = Vec::new();
             let selected_index = palette.selected.min(matches.len().saturating_sub(1));
             if matches.is_empty() {
@@ -2056,19 +2136,25 @@ impl Render for Scratchpad {
                 } else {
                     rgb(0xa6adc8)
                 };
-                let info_index = *transform_index;
+                let description = transform.description;
                 let info_icon = div()
-                    .child("\u{24D8}")
+                    .child("info")
+                    .text_size(px(11.0))
                     .text_color(rgb(0x6c7086))
-                    .id(("transform-info", info_index))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        if *hovered {
-                            this.palette_hover = Some(info_index);
-                        } else if this.palette_hover == Some(info_index) {
-                            this.palette_hover = None;
-                        }
-                        cx.notify();
-                    }));
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .id(("transform-info", *transform_index))
+                    // Clicking the label must not also apply the transform.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                    )
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .tooltip(move |_window, cx| {
+                        cx.new(|_| PaletteTooltip { text: description }).into()
+                    });
                 let item = div()
                     .flex()
                     .flex_row()
@@ -2084,18 +2170,15 @@ impl Render for Scratchpad {
                 } else {
                     item
                 };
+                let item = item
+                    .id(("transform-row", *transform_index))
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        if let Some(palette) = &mut this.palette {
+                            palette.selected = position;
+                        }
+                        this.apply_selected_transform(window, cx);
+                    }));
                 items.push(item.into_any_element());
-                if self.palette_hover == Some(*transform_index) {
-                    items.push(
-                        div()
-                            .px(px(8.0))
-                            .pb(px(4.0))
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x9399b2))
-                            .child(transform.description)
-                            .into_any_element(),
-                    );
-                }
             }
 
             div()
@@ -2129,7 +2212,17 @@ impl Render for Scratchpad {
                                 .text_color(rgb(0xf5e0dc))
                                 .child(format!("> {}\u{258F}", palette.query)),
                         )
-                        .children(items),
+                        .child(
+                            div()
+                                .id("zapslab-palette-scroll")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(list_max_height))
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.palette_scroll)
+                                .children(items),
+                        ),
                 )
         });
 

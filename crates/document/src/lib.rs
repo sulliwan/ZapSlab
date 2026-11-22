@@ -174,6 +174,22 @@ impl Document {
         self.insert_run = None;
     }
 
+    /// Selects the byte range `start..end`, clamping both ends into the
+    /// document. Used by the view after a transform so the transformed output
+    /// stays selected. Returns whether the selection changed.
+    pub fn select_range(&mut self, start: usize, end: usize) -> bool {
+        let start = self.clamp_boundary(start);
+        let end = self.clamp_boundary(end).max(start);
+        let changed = self.anchor != start || self.cursor != end;
+        self.anchor = start;
+        self.cursor = end;
+        if changed {
+            // Explicit selection breaks any in-progress typing run.
+            self.insert_run = None;
+        }
+        changed
+    }
+
     // ---- Navigation -----------------------------------------------------
 
     pub fn move_left(&mut self, extend: bool) -> bool {
@@ -420,6 +436,24 @@ mod tests {
 
     fn doc(text: &str) -> Document {
         Document::new(text.to_string())
+    }
+
+    #[test]
+    fn select_range_selects_the_replaced_output() {
+        let mut document = doc("hello");
+        assert!(document.replace_range(0, 5, "HELLO"));
+        assert!(document.select_range(0, 5));
+        assert_eq!(document.selection_range(), (0, 5));
+        assert_eq!(document.anchor(), 0);
+        assert_eq!(document.cursor(), 5);
+    }
+
+    #[test]
+    fn select_range_clamps_into_the_document() {
+        let mut document = doc("aé");
+        document.select_range(0, 99);
+        assert_eq!(document.selection_range(), (0, 3));
+        assert!(!document.select_range(0, 3));
     }
 
     #[test]

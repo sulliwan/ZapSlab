@@ -24,7 +24,7 @@ pub(crate) mod random;
 mod stats;
 mod text;
 
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 /// Which text a transform reads and writes back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,4 +109,141 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
 /// selection; everything else is always applicable.
 pub fn is_available(transform: &Transform, has_selection: bool) -> bool {
     !(transform.scope == Scope::Selection && !has_selection)
+}
+
+/// Relevance of `transform` for a lowercased `query`, or `None` if it does not
+/// match. Name matches always outrank tag/description matches.
+fn match_score(transform: &Transform, query: &str) -> Option<u32> {
+    let name = transform.name.to_lowercase();
+    let tags = transform.tags.to_lowercase();
+    if name == query {
+        Some(100)
+    } else if name.starts_with(query) {
+        Some(80)
+    } else if name.split_whitespace().any(|word| word.starts_with(query)) {
+        Some(60)
+    } else if name.contains(query) {
+        Some(50)
+    } else if tags.split(',').any(|tag| tag.trim().starts_with(query)) {
+        Some(30)
+    } else if tags.contains(query) {
+        Some(20)
+    } else if transform.description.to_lowercase().contains(query) {
+        Some(10)
+    } else {
+        None
+    }
+}
+
+/// Palette ordering for `query`: best match first.
+///
+/// A command's own name outranks a substring that only appears in another
+/// entry's description, so "bas" lists "Base64 …" ahead of "Deburr" (whose
+/// description says "basic"). Recently used transforms are promoted: with an
+/// empty query they lead in recency order, and with a query they only break
+/// relevance ties.
+pub fn search(query: &str, recent: &[String]) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+
+    if query.is_empty() {
+        let mut ordered = Vec::with_capacity(TRANSFORMS.len());
+        let mut included = vec![false; TRANSFORMS.len()];
+        for name in recent {
+            if let Some(index) = TRANSFORMS
+                .iter()
+                .position(|transform| transform.name == name.as_str())
+            {
+                if !included[index] {
+                    included[index] = true;
+                    ordered.push(index);
+                }
+            }
+        }
+        for (index, _) in TRANSFORMS.iter().enumerate() {
+            if !included[index] {
+                ordered.push(index);
+            }
+        }
+        return ordered;
+    }
+
+    // Name -> recency position (0 = newest); duplicate names keep the first.
+    let mut recency: HashMap<&str, usize> = HashMap::new();
+    for (position, name) in recent.iter().enumerate() {
+        recency.entry(name.as_str()).or_insert(position);
+    }
+
+    let mut scored: Vec<(u32, usize, usize)> = TRANSFORMS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, transform)| {
+            let score = match_score(transform, &query)?;
+            let recent_rank = recency.get(transform.name).copied().unwrap_or(usize::MAX);
+            Some((score, recent_rank, index))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    scored.into_iter().map(|(_, _, index)| index).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn position_of(order: &[usize], name: &str) -> usize {
+        order
+            .iter()
+            .position(|&index| TRANSFORMS[index].name == name)
+            .unwrap_or_else(|| panic!("{name} missing from search results"))
+    }
+
+    #[test]
+    fn empty_query_keeps_registry_order() {
+        let order = search("", &[]);
+        assert_eq!(order, (0..TRANSFORMS.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn name_prefix_beats_description_substring() {
+        // Regression: "bas" must find the Base64 commands, not Deburr (whose
+        // description contains "basic").
+        let order = search("bas", &[]);
+        assert!(position_of(&order, "Base64 Encode") < position_of(&order, "Deburr"));
+        assert!(position_of(&order, "Base64 Decode") < position_of(&order, "Deburr"));
+    }
+
+    #[test]
+    fn exact_name_ranks_first() {
+        assert_eq!(TRANSFORMS[search("rot13", &[])[0]].name, "Rot13");
+    }
+
+    #[test]
+    fn recent_transforms_lead_the_empty_query() {
+        let recent = vec!["Rot13".to_string(), "MD5 Checksum".to_string()];
+        let order = search("", &recent);
+        assert_eq!(TRANSFORMS[order[0]].name, "Rot13");
+        assert_eq!(TRANSFORMS[order[1]].name, "MD5 Checksum");
+
+        // Every transform still appears exactly once.
+        let mut indices = order.clone();
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(indices.len(), TRANSFORMS.len());
+    }
+
+    #[test]
+    fn recency_breaks_relevance_ties() {
+        let recent = vec!["Minify JSON".to_string()];
+        let order = search("json", &recent);
+        assert!(position_of(&order, "Minify JSON") < position_of(&order, "Format JSON"));
+    }
+
+    #[test]
+    fn unknown_recent_names_are_ignored() {
+        let recent = vec!["Not A Transform".to_string()];
+        assert_eq!(
+            search("", &recent),
+            (0..TRANSFORMS.len()).collect::<Vec<_>>()
+        );
+    }
 }
