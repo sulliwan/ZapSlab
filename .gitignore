@@ -26,3 +26,6 @@ rustc-ice-*.txt
 # boopweb build outputs
 /dist
 /.cache
+
+# Standalone pure-model crate: its lockfile is generated when running its tests
+/crates/document/Cargo.lock

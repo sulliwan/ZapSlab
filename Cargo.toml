@@ -1,0 +1,42 @@
+[package]
+name = "boopweb"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The web backend lives only in the zed repo (the published crates.io `gpui`
+# has no wasm support yet), so all gpui crates come from one pinned revision.
+# Bump all three together.
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
+gpui_web = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
+base64 = "0.22"
+boopweb-document = { path = "crates/document" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Keep this in lockstep with the wasm-bindgen crate that the pinned zed rev
+# resolves to (0.2.127, via wgpu -> js-sys). The wasm-bindgen-cli in the
+# builder image must match this version exactly.
+wasm-bindgen = "=0.2.127"
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+console_error_panic_hook = "0.1"
+
+# Firefox / WebGL2 fix: on this backend gpui creates its 2 MiB instance texture
+# as 65536x2 Rgba32Uint (1 MiB per row), which exceeds wgpu-core's 512 KiB zero
+# buffer used to zero-initialize textures on creation. This points at a copy of
+# the pinned wgpu revision with ZERO_BUFFER_SIZE raised to 4 MiB. Materialized
+# by `make vendor-wgpu` (gitignored; see docs/m0-spike.md).
+[patch."https://github.com/gfx-rs/wgpu"]
+wgpu = { path = ".cache/wgpu-patched/wgpu" }
+wgpu-core = { path = ".cache/wgpu-patched/wgpu-core" }
+wgpu-hal = { path = ".cache/wgpu-patched/wgpu-hal" }
+wgpu-types = { path = ".cache/wgpu-patched/wgpu-types" }
+naga = { path = ".cache/wgpu-patched/naga" }
+
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

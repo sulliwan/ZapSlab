@@ -1,0 +1,17 @@
+[package]
+name = "boopweb-document"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Declaring an (empty) workspace makes this crate its own workspace root, so it
+# is built and tested independently of the gpui editor package. Its dependencies
+# are pure-Rust Unicode crates (no gpui/wasm), so `cargo test` stays offline and
+# fast to compile.
+[workspace]
+
+[dependencies]
+# Extended grapheme clusters: the model's definition of a "character".
+unicode-segmentation = "=1.13.3"
+# General_Category lookups for deciding which characters are invisible.
+unicode-properties = "=0.1.3"
