@@ -111,6 +111,38 @@ pub fn is_available(transform: &Transform, has_selection: bool) -> bool {
     !(transform.scope == Scope::Selection && !has_selection)
 }
 
+/// Whether a transform can take noticeably long on a large input (sorts,
+/// parsers, formatters, shuffles). The view confirms before running one of
+/// these against a big range so the UI does not appear to hang.
+///
+/// This is intentionally a name list rather than a per-entry field so adding a
+/// transform does not require touching every other entry; keep it in sync when
+/// adding a heavy one.
+pub fn is_expensive(transform: &Transform) -> bool {
+    matches!(
+        transform.name,
+        "Sort lines"
+            | "Natural Sort Lines"
+            | "Shuffle Lines"
+            | "Remove Duplicate Lines"
+            | "Format JSON"
+            | "Minify JSON"
+            | "Sort JSON"
+            | "JSON to CSV"
+            | "CSV to JSON"
+            | "JSON to YAML"
+            | "YAML to JSON"
+            | "JSON to Query String"
+            | "Query String to JSON"
+            | "JWT Decode"
+            | "Format XML"
+            | "Minify XML"
+            | "Format SQL"
+            | "Minify SQL"
+            | "Eval Javascript"
+    )
+}
+
 /// Relevance of `transform` for a lowercased `query`, or `None` if it does not
 /// match. Name matches always outrank tag/description matches.
 fn match_score(transform: &Transform, query: &str) -> Option<u32> {
@@ -236,6 +268,22 @@ mod tests {
         let recent = vec!["Minify JSON".to_string()];
         let order = search("json", &recent);
         assert!(position_of(&order, "Minify JSON") < position_of(&order, "Format JSON"));
+    }
+
+    #[test]
+    fn flags_expensive_transforms() {
+        let find = |name: &str| {
+            TRANSFORMS
+                .iter()
+                .find(|transform| transform.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert!(is_expensive(find("Sort lines")));
+        assert!(is_expensive(find("Format JSON")));
+        assert!(is_expensive(find("Format SQL")));
+        assert!(!is_expensive(find("Rot13")));
+        assert!(!is_expensive(find("MD5 Checksum")));
+        assert!(!is_expensive(find("Count Characters")));
     }
 
     #[test]

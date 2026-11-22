@@ -8,19 +8,30 @@ including the split between the pure document model and the gpui view.
 
 Zapslab is a WASM/GPUI scratchpad editor, similar in spirit to Boop, shipped as
 an installable PWA. A single window hosts a plain-text editor with soft wrap,
-selection, undo/redo, a transform palette, and localStorage autosave. It is a
-small codebase with a deliberately thin, pure core and a gpui rendering shell.
+selection, undo/redo, a transform palette, and IndexedDB autosave. It targets
+documents up to 64 MB: rendering is virtualized (only visible rows are built)
+and the pure model keeps an incremental line index so edits do not scan the
+whole buffer. It is a small codebase with a deliberately thin, pure core and a
+gpui rendering shell.
 
 ## Repository layout
 
 ```
 src/                 root crate `zapslab` (gpui view + platform glue)
   main.rs            bootstrap, window creation, embedded fonts
-  app.rs             Scratchpad: rendering, geometry, input, palette, scrollbar
-  storage.rs         localStorage autosave (wasm-only + non-wasm stub)
+  app.rs             Scratchpad: rendering, geometry, input, palette, scrollbars
+  storage.rs         IndexedDB document + localStorage recent list
+                     (wasm-only + non-wasm stub)
   transforms/        pure transform registry (mod.rs + category submodules;
                      each entry has name/tags/scope + fn(&str) -> TransformResult)
 crates/document/     standalone crate `zapslab-document` (pure model + tests)
+  lib.rs             Document: text, cursor/anchor, undo, UTF-16 mapping, cap
+  line_index.rs      incremental per-line byte lengths + Fenwick prefix sums
+  grapheme.rs        local grapheme stepping (GraphemeCursor) + full-scan fallback
+  display.rs         display-aware wrapping / x mapping (width injectable)
+  encoding.rs        text <-> bytes for the hex pane
+  hexdump.rs         hex layout
+  escape.rs          invisible-character escaping
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
 docker/Dockerfile    pinned builder image (Rust + wasm32 + wasm-bindgen + binaryen)
@@ -31,7 +42,9 @@ dist/                generated web output (gitignored)
 
 The pure document model lives in `crates/document` (package `zapslab-document`).
 Treat that crate as the home for all non-gpui logic described below; the gpui
-`Scratchpad` view delegates text, cursor, line-index, and undo work to it.
+`Scratchpad` view delegates text, cursor, the incremental line index, UTF-16
+mapping, and undo work to it. The document is a flat `String` plus indices (no
+rope); the invariants that keep edits off the whole buffer are described below.
 
 ## Build, check, test, and serve
 
@@ -62,6 +75,11 @@ Rules:
   gpui/wasm, so it can be tested directly with
   `cd crates/document && cargo test`. Prefer `make test` for consistency; it runs
   the same tests in the container.
+- `make test` covers **only** `crates/document`. The root crate's `#[cfg(test)]`
+  code (including `src/transforms/`) is not run by any Makefile target. Type-check
+  it inside the builder image with
+  `cargo check --tests --target wasm32-unknown-unknown`; to actually run those
+  tests, use a standalone crate that path-includes `src/transforms/mod.rs`.
 - The `wasm-bindgen` crate pin (`=0.2.127`) and the builder image's
   `wasm-bindgen-cli` must match exactly. The three gpui crates are pinned to one
   zed revision; bump them together.
@@ -77,7 +95,7 @@ Rules:
 flowchart TD
     main["src/main.rs<br/>bootstrap + fonts"] --> app["src/app.rs<br/>Scratchpad (gpui)"]
     app --> doc["crates/document<br/>Document (pure std)"]
-    app --> storage["src/storage.rs<br/>localStorage"]
+    app --> storage["src/storage.rs<br/>IndexedDB + localStorage"]
     app --> transforms["src/transforms/<br/>pure registry"]
 ```
 
@@ -86,10 +104,18 @@ flowchart TD
 Owns everything that is text, offsets, or history:
 
 - document text and its **byte-offset** cursor/anchor;
-- the line-start index and line/offset queries;
-- undo/redo snapshots with a bounded history;
-- UTF-16 ⇄ byte offset conversion for the platform input handler;
-- CRLF/CR → `\n` normalization (the model invariant is "no `\r` in `text`").
+- the **incremental line index** (`line_index.rs`): per-line byte lengths plus a
+  Fenwick tree of prefix sums, so `line_of_offset`/`line_range` are O(log lines)
+  and a single-line edit is one point update;
+- undo/redo snapshots with a bounded history (currently full-text snapshots;
+  delta/inverse-edit undo is a known follow-up — see "Current status and known
+  limitations");
+- UTF-16 ⇄ byte offset conversion with a cached `utf16_len` and nearer-end
+  walks, plus free functions for arbitrary strings (e.g. the palette query);
+- local grapheme stepping (`grapheme.rs`) using `unicode-segmentation`'s
+  `GraphemeCursor`, with the old full scan kept only as a fallback;
+- CRLF/CR → `\n` normalization (the model invariant is "no `\r` in `text`");
+- the `MAX_DOCUMENT_BYTES` (64 MB) cap and a `revision` counter for view caches.
 
 Rules:
 
@@ -102,16 +128,40 @@ Rules:
   line queries, UTF-16 mapping. Return results instead of touching a window.
 - If a helper needs a glyph advance or a viewport width, it is *not* pure model
   logic; keep the measurement in the view and pass bytes/offsets across.
+- **Never reintroduce whole-buffer scans on the editing hot path.** The line
+  index, `utf16_len`, and grapheme/UTF-16 stepping are incremental/local for this
+  reason. A new line/offset/boundary helper belongs in `line_index.rs` or
+  `grapheme.rs` as a local algorithm, with a differential test against a full
+  scan.
+- **Line semantics are a hard invariant.** Every line but the last ends with
+  `\n`, and a trailing `\n` yields a final empty line. `LineIndex` stores byte
+  lengths *including* the newline; `apply_edit` recomputes only touched lines and
+  decides `final_region` by whether the last touched line is the document's last
+  line. Keep `line_count`/`line_of_offset`/`line_range` behavior identical.
+- **Keep `utf16_len` in sync** on every mutation (`replace_range`, `restore`,
+  `new`); the converters rely on it.
 
 ### `zapslab` — gpui view
 
 `Scratchpad` in `src/app.rs` stays responsible for:
 
-- rendering (`div` per visual row, `canvas` overlay for caret/selection);
+- **virtualized rendering**: only rows in (and just around) the viewport are
+  materialized, positioned by top/bottom spacers inside a content element with an
+  explicit height. `WrapLayout` caches per-line wrap counts as prefix sums, keyed
+  by document revision + `(wrap on, invisibles, rounded width)`, rebuilt lazily.
+  A `canvas` overlay paints selection/caret in content space;
 - geometry: font metrics, glyph advances, soft-wrap row layout, hit-testing,
-  caret bounds, scrollbar layout and drag;
+  caret bounds; **custom horizontal and vertical scrollbars** (gpui draws none
+  for overflow containers) with drag support;
+- **wrap auto-disable**: past `WRAP_DISABLE_BYTES`/`WRAP_DISABLE_LINES` soft wrap
+  is forced off (identity row mapping) and the toggle refuses to re-enable it;
 - input routing (`on_key_down`, `EntityInputHandler`), focus, clipboard;
-- async work (the caret blink task) and any debouncing timers;
+- **size refusal**: refuse input that would exceed `MAX_DOCUMENT_BYTES` before
+  mutating (`Attempted paste was too large.` for an oversized paste, a generic
+  limit message otherwise);
+- **expensive-transform confirmation**: `transforms::is_expensive` plus a 2 MB
+  input threshold opens a modal instead of blocking the UI;
+- async work (caret blink, IndexedDB load/save) and any debouncing timers;
 - presentation-only state (palette UI, scroll handles, drag state).
 
 `src/main.rs` only bootstraps: install the panic hook, register the embedded
@@ -120,16 +170,25 @@ startup failures (fonts/window); avoid panics on the input hot path.
 
 ### Storage
 
-`src/storage.rs` is localStorage autosave for the browser. It is
-`#[cfg(target_arch = "wasm32")]` with a no-op non-wasm stub so native builds and
-tests still compile; keep the public signatures identical across both.
+`src/storage.rs` persists the document in **IndexedDB** (localStorage's
+~5–10 MB quota cannot hold a 64 MB document). It is
+`#[cfg(target_arch = "wasm32")]` with a non-wasm stub that returns immediately;
+keep the public signatures identical across both.
 
-- Keys are versioned (`zapslab.text.v1`): an old version is ignored and
-  overwritten, not migrated.
-- `save` is **fallible** and callers must surface failures (e.g. a status-bar
-  message). Do not silently discard a failed save.
-- localStorage writes happen on the editing hot path; debounce/throttle them
-  rather than writing synchronously on every keystroke.
+- **Document text → IndexedDB**: database `zapslab`, object store `documents`,
+  key `text.v1`. **Recent transforms → localStorage** (`zapslab.recent.v1`,
+  small and synchronous).
+- `load`/`save` are **async** on both targets. IndexedDB requests are bridged to
+  Rust futures with `wasm-bindgen-futures`; the wasm-only deps are `js-sys` and
+  `wasm-bindgen-futures`, and `web-sys` enables the `Idb*` features.
+- **One-time migration**: if IndexedDB is empty, the legacy localStorage
+  `zapslab.text.v1` value is copied in and the old key removed *only after a
+  successful write*. Keys stay versioned (old versions ignored, not migrated).
+- `save` is **fallible** and callers surface failures (status bar); do not
+  silently discard a failed save.
+- Writes are debounced (500 ms; 2 s above 4 MB, where copying/writing is
+  expensive). Copy the text only after the debounce fires, never on every
+  keystroke, and never block typing on storage.
 
 ## Coding principles and patterns
 
@@ -150,14 +209,32 @@ tests still compile; keep the public signatures identical across both.
   `VecDeque` (`push_back`/`pop_front`) in `zapslab-document`, enforcing
   `MAX_UNDO`. Do not reintroduce `Vec::remove(0)` on the hot path. Preserve the
   behavior of not pushing duplicate snapshots, and keep contiguous typing runs
-  coalesced into a single undo step.
-- **Throttle expensive synchronous side effects** on the hot path. localStorage
-  writes should be coalesced/debounced; do not block typing on storage.
+  coalesced into a single undo step. Snapshots currently clone the whole text
+  (O(n) per non-coalesced edit); if you move to delta/inverse-edit undo, keep the
+  public `undo`/`redo` semantics (coalescing, dedupe, cursor/anchor restore).
+- **Throttle expensive synchronous side effects** on the hot path. IndexedDB
+  writes are debounced and async; copy the document only after the debounce, and
+  never block typing on storage.
+- **Document is a flat `String`, not a rope.** Mid-buffer edits pay a memmove and
+  line-count-changing edits re-splice the length vector (O(lines)), but the hot
+  path never rescans the text. Do not add a rope without a project-wide decision.
+- **Virtualization invariants.** Uniform row height; only visible rows are built;
+  the content element carries an explicit total height with top/bottom spacers;
+  the overlay paints in content space so caret/selection align with the rows. The
+  `WrapLayout` cache must invalidate on document `revision` and on wrap settings.
+- **Refuse over-limit input before mutating.** Check `MAX_DOCUMENT_BYTES` in the
+  view and again in the model. An oversized paste gets the dedicated message;
+  other overflows get the generic limit message.
+- **Keep the expensive-transform list current.** `transforms::is_expensive` is a
+  name list; add any new sort/parser/formatter/shuffle so the confirmation modal
+  covers it.
 - **Use `#[cfg(target_arch = "wasm32")]` with a non-wasm stub** for platform
   code and keep public signatures uniform, so callers compile on both targets.
 - **UTF-16 is the platform boundary.** `EntityInputHandler` speaks UTF-16; the
-  model works in byte offsets. Convert only at the edges
-  (`utf16_offset` / `byte_offset_for_utf16`) and always respect
+  model works in byte offsets. For document offsets use the `Document` methods
+  (`utf16_offset` / `byte_offset_for_utf16`), which walk from the nearer end
+  using the cached `utf16_len`; the free functions of the same name are for
+  arbitrary strings (e.g. the palette query). Always respect
   `str::is_char_boundary` when clamping or stepping.
 - **Keep CRLF normalization centralized** at document boundaries (load and
   insert/replace), so line and wrap math can assume `\n` only.
@@ -177,8 +254,12 @@ tests still compile; keep the public signatures identical across both.
 - Treat these as high-risk and test them:
   - UTF-16 ⇄ byte mapping, especially astral characters (surrogate pairs/emoji)
     and positions inside a multi-byte character;
-  - the line model: `line_starts`, `line_of_offset`, `line_range` (excluding the
-    trailing newline), empty lines, trailing newline, end-of-document;
+  - the line model (`LineIndex`): `line_of_offset`, `line_start`, `line_range`
+    (excluding the trailing newline), empty lines, trailing newline,
+    end-of-document, and incremental `apply_edit` vs. a from-scratch rebuild
+    (exhaustive + seeded fuzz);
+  - local grapheme stepping, UTF-16 conversion, and `word_range_at`: differential
+    tests against full-scan references over a Unicode corpus at every offset;
   - undo/redo: push/dedupe, bounded history, restore of text + cursor + anchor;
   - CRLF/CR normalization on load and on insert/paste;
   - wrapping: row splitting and offset↔row↔x mapping. Keep glyph measurement
@@ -194,6 +275,9 @@ tests still compile; keep the public signatures identical across both.
 
 - [ ] `make check` compiles cleanly for `wasm32-unknown-unknown`.
 - [ ] `make test` passes, and new pure logic has unit tests in `crates/document`.
+- [ ] Hot-path edits do not scan the whole buffer (line index / grapheme / UTF-16
+      stay incremental or local).
+- [ ] Input that would exceed `MAX_DOCUMENT_BYTES` is refused before mutating.
 - [ ] Pure logic lives in `crates/document`; no gpui/wasm imports there.
 - [ ] Public signatures stay uniform across wasm and non-wasm builds.
 - [ ] Errors that affect the user are surfaced (especially autosave).
@@ -203,10 +287,23 @@ tests still compile; keep the public signatures identical across both.
 - [ ] New pure-logic dependencies in `crates/document` are vetted Unicode crates
       (no gpui/wasm) and pinned to the versions available in the build cache.
 
+## Current status and known limitations
+
+- **Undo is still full-text snapshots.** A non-coalesced edit clones the whole
+  document (O(n)); delta/inverse-edit undo is the next planned change. Typing runs
+  coalesce, so ordinary typing does not clone per keystroke.
+- **Hex panel is not virtualized.** While open it re-encodes and lays out the
+  whole buffer each frame; caching/virtualizing it is planned.
+- **Wrap-on layout rebuild is O(lines log n)** and only runs for documents below
+  the auto-disable thresholds; large buffers use wrap-off with O(1) row mapping.
+- **Pixel geometry is `f32`.** Very high row counts (tens of millions) can lose
+  scroll precision; typical 64 MB text is well within limits.
+
 ## When to ask
 
 Raise decisions with product or UX tradeoffs with the user instead of guessing.
-Examples: autosave debounce interval and failure UI, undo-history size and
-grouping, wrap/scrollbar behavior, palette interaction and keybindings, and
-whether a transform should preserve or replace selection. Implement the
-mechanical part; ask before locking in a user-visible behavior change.
+Examples: the 64 MB cap and refusal wording, autosave debounce and failure UI,
+undo-history strategy (snapshot vs. delta), wrap auto-disable thresholds and
+scrollbar behavior, palette interaction and keybindings, and whether a transform
+should preserve or replace selection. Implement the mechanical part; ask before
+locking in a user-visible behavior change.

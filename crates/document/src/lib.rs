@@ -1,7 +1,7 @@
 //! Pure document model for Zapslab.
 //!
 //! Everything here is plain `std`: text, the byte-offset cursor/anchor, the
-//! line-start index, the bounded undo/redo history, and the UTF-16 ⇄ byte
+//! incremental line index, the bounded undo/redo history, and the UTF-16 ⇄ byte
 //! offset conversion used at the platform input boundary. There are no `gpui`,
 //! `wasm-bindgen`, or `web-sys` imports, so the whole model is unit-testable
 //! offline with `cargo test`.
@@ -9,7 +9,10 @@
 //! Invariants:
 //! - `text` never contains `\r`; CRLF/CR is normalized on the way in.
 //! - `cursor` and `anchor` are always char boundaries into `text`.
-//! - `line_starts[0] == 0` and every entry points just past a `\n`.
+//! - Every line but the last ends with `\n`; a trailing `\n` is a final empty
+//!   line. The line index stores each line's byte length (including its
+//!   newline) and keeps prefix sums incrementally.
+//! - `utf16_len` always equals `text.encode_utf16().count()`.
 
 pub mod display;
 pub mod encoding;
@@ -17,15 +20,21 @@ pub mod escape;
 pub mod grapheme;
 pub mod hexdump;
 
+mod line_index;
+
 use std::{borrow::Cow, collections::VecDeque};
 
-use crate::grapheme::{
-    grapheme_ranges, next_grapheme_boundary, previous_grapheme_boundary, snap_to_grapheme,
-};
+use crate::grapheme::{next_grapheme_boundary, previous_grapheme_boundary, snap_to_grapheme};
+use crate::line_index::LineIndex;
 
 /// Maximum number of undo snapshots retained. Older snapshots are evicted
 /// from the front of the ring so the ends stay O(1).
 pub const MAX_UNDO: usize = 200;
+
+/// Hard cap on the document's UTF-8 byte length. Edits that would grow the
+/// document past this are refused by [`Document::replace_range`]; the view
+/// surfaces a message and refuses the input before it reaches the model.
+pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Snapshot {
@@ -46,10 +55,16 @@ pub struct Document {
     text: String,
     cursor: usize,
     anchor: usize,
-    line_starts: Vec<usize>,
+    lines: LineIndex,
+    /// Total UTF-16 code units in `text`, maintained incrementally so the
+    /// platform-boundary conversions can walk from the nearer end.
+    utf16_len: usize,
     undo: VecDeque<Snapshot>,
     redo: VecDeque<Snapshot>,
     insert_run: Option<InsertRun>,
+    /// Bumped whenever the text changes. The view uses it to invalidate cached
+    /// layout that depends on the document's contents (e.g. soft wrapping).
+    revision: u64,
 }
 
 impl Document {
@@ -62,17 +77,19 @@ impl Document {
             text
         };
         let cursor = text.len();
-        let mut document = Self {
+        let lines = LineIndex::new(&text);
+        let utf16_len = text.encode_utf16().count();
+        Self {
             text,
             cursor,
             anchor: cursor,
-            line_starts: Vec::new(),
+            lines,
+            utf16_len,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             insert_run: None,
-        };
-        document.rebuild_line_starts();
-        document
+            revision: 0,
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -85,6 +102,11 @@ impl Document {
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    /// Monotonic counter bumped on every text mutation (edits, undo, redo).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn cursor(&self) -> usize {
@@ -106,36 +128,64 @@ impl Document {
 
     // ---- Line model -----------------------------------------------------
 
-    fn rebuild_line_starts(&mut self) {
-        self.line_starts.clear();
-        self.line_starts.push(0);
-        for (index, byte) in self.text.bytes().enumerate() {
-            if byte == b'\n' {
-                self.line_starts.push(index + 1);
-            }
-        }
-    }
-
     pub fn line_count(&self) -> usize {
-        self.line_starts.len()
+        self.lines.line_count()
     }
 
     pub fn line_of_offset(&self, offset: usize) -> usize {
-        match self.line_starts.partition_point(|&start| start <= offset) {
-            0 => 0,
-            count => count - 1,
-        }
+        self.lines.line_of_offset(offset)
     }
 
     /// Byte range of a line, excluding its trailing newline.
     pub fn line_range(&self, line: usize) -> (usize, usize) {
-        let start = self.line_starts[line];
-        let end = if line + 1 < self.line_starts.len() {
-            self.line_starts[line + 1] - 1
+        self.lines.line_range(line)
+    }
+
+    // ---- UTF-16 offsets -------------------------------------------------
+    // The platform input handler works in UTF-16 code units while the model
+    // works in byte offsets. Converting from the nearer end keeps the common
+    // case (edits at the cursor) proportional to the distance, not the length.
+
+    /// UTF-16 code-unit offset for `byte_offset`, snapping down to a char
+    /// boundary first.
+    pub fn utf16_offset(&self, byte_offset: usize) -> usize {
+        let mut byte = byte_offset.min(self.text.len());
+        while byte > 0 && !self.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        if byte <= self.text.len() / 2 {
+            self.text[..byte].encode_utf16().count()
         } else {
-            self.text.len()
-        };
-        (start, end)
+            self.utf16_len - self.text[byte..].encode_utf16().count()
+        }
+    }
+
+    /// Byte offset for a UTF-16 code-unit offset. Mirrors
+    /// [`byte_offset_for_utf16`] (an offset inside a surrogate pair snaps to the
+    /// pair's start) but walks from the nearer end using the cached total.
+    pub fn byte_offset_for_utf16(&self, utf16: usize) -> usize {
+        if utf16 == 0 {
+            return 0;
+        }
+        if utf16 >= self.utf16_len {
+            return self.text.len();
+        }
+        if utf16 <= self.utf16_len / 2 {
+            return byte_offset_for_utf16(&self.text, utf16);
+        }
+        let mut units_after = 0usize;
+        for (index, ch) in self.text.char_indices().rev() {
+            let units_before = self.utf16_len - units_after - ch.len_utf16();
+            if units_before < utf16 {
+                return if utf16 == self.utf16_len - units_after {
+                    index + ch.len_utf8()
+                } else {
+                    index
+                };
+            }
+            units_after += ch.len_utf16();
+        }
+        self.text.len()
     }
 
     // ---- Boundaries -----------------------------------------------------
@@ -216,7 +266,7 @@ impl Document {
 
     pub fn move_home(&mut self, extend: bool) -> bool {
         let line = self.line_of_offset(self.cursor);
-        let start = self.line_starts[line];
+        let start = self.lines.line_start(line);
         self.set_cursor(start, extend)
     }
 
@@ -233,31 +283,40 @@ impl Document {
     /// so a base character and its combining marks are never split.
     pub fn word_range_at(&self, offset: usize) -> (usize, usize) {
         let offset = snap_to_grapheme(&self.text, offset);
-        let graphemes: Vec<(usize, usize)> = grapheme_ranges(&self.text).collect();
-        if graphemes.is_empty() {
+        if self.text.is_empty() {
             return (0, 0);
         }
-        let class = |start: usize| -> u8 {
+        let class_at = |start: usize| -> u8 {
             match self.text[start..].chars().next() {
                 Some(c) if c.is_alphanumeric() || c == '_' => 0,
                 Some(c) if c.is_whitespace() => 1,
                 _ => 2,
             }
         };
-        let index = graphemes
-            .iter()
-            .rposition(|&(start, _)| start <= offset)
-            .unwrap_or(0);
-        let target = class(graphemes[index].0);
-        let mut first = index;
-        while first > 0 && class(graphemes[first - 1].0) == target {
-            first -= 1;
+        // Snap onto the cluster containing `offset`; at end-of-text select the
+        // last cluster. Expansion then walks whole clusters outward, so the
+        // cost is the size of the run, not the size of the document.
+        let current = if offset == self.text.len() {
+            previous_grapheme_boundary(&self.text, offset)
+        } else {
+            offset
+        };
+        let target = class_at(current);
+
+        let mut first = current;
+        while first > 0 {
+            let previous = previous_grapheme_boundary(&self.text, first);
+            if class_at(previous) != target {
+                break;
+            }
+            first = previous;
         }
-        let mut last = index;
-        while last + 1 < graphemes.len() && class(graphemes[last + 1].0) == target {
-            last += 1;
+
+        let mut last = next_grapheme_boundary(&self.text, current);
+        while last < self.text.len() && class_at(last) == target {
+            last = next_grapheme_boundary(&self.text, last);
         }
-        (graphemes[first].0, graphemes[last].1)
+        (first, last)
     }
 
     // ---- Editing --------------------------------------------------------
@@ -276,6 +335,11 @@ impl Document {
 
         let insert = normalize_newlines(insert);
         let inserted = insert.as_ref();
+        // Enforce the hard size cap. `start`/`end` are clamped above, so
+        // `end - start <= text.len()` and the subtraction cannot underflow.
+        if self.text.len() - (end - start) + inserted.len() > MAX_DOCUMENT_BYTES {
+            return false;
+        }
         let single_char = start == end && !inserted.contains('\n') && inserted.chars().count() == 1;
 
         let coalesce = single_char
@@ -298,10 +362,15 @@ impl Document {
             };
         }
 
+        let removed_utf16 = self.text[start..end].encode_utf16().count();
+        let inserted_utf16 = inserted.encode_utf16().count();
         self.text.replace_range(start..end, inserted);
         self.cursor = start + inserted.len();
         self.anchor = self.cursor;
-        self.rebuild_line_starts();
+        self.lines
+            .apply_edit(&self.text, start, end, inserted.len());
+        self.utf16_len = self.utf16_len - removed_utf16 + inserted_utf16;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -386,7 +455,9 @@ impl Document {
         self.cursor = self.clamp_boundary(snapshot.cursor);
         self.anchor = self.clamp_boundary(snapshot.anchor);
         self.insert_run = None;
-        self.rebuild_line_starts();
+        self.lines = LineIndex::new(&self.text);
+        self.utf16_len = self.text.encode_utf16().count();
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -714,5 +785,129 @@ mod tests {
     #[test]
     fn word_range_of_empty_document_is_empty() {
         assert_eq!(doc("").word_range_at(0), (0, 0));
+    }
+
+    #[test]
+    fn revision_advances_on_edits_and_undo() {
+        let mut document = doc("abc");
+        let before = document.revision();
+        assert!(document.insert_text("d"));
+        let after_edit = document.revision();
+        assert!(after_edit > before);
+        assert!(document.undo());
+        assert!(document.revision() > after_edit);
+    }
+
+    #[test]
+    fn edits_beyond_the_size_cap_are_refused() {
+        let mut document = doc(&"a".repeat(MAX_DOCUMENT_BYTES));
+        let before = document.revision();
+        // One more byte would exceed the cap.
+        assert!(!document.insert_text("b"));
+        assert_eq!(document.len(), MAX_DOCUMENT_BYTES);
+        assert_eq!(document.revision(), before);
+        // A shrinking edit is still allowed at the cap.
+        assert!(document.backspace());
+    }
+
+    #[test]
+    fn document_utf16_matches_free_functions() {
+        for text in [
+            "",
+            "abc",
+            "héllo",
+            "😀",
+            "a😀b",
+            "e\u{301}x",
+            "😀😀",
+            "a\nb😀c",
+            "😀x😀",
+        ] {
+            let document = doc(text);
+            let utf16_len = text.encode_utf16().count();
+            for byte in 0..=text.len() {
+                assert_eq!(
+                    document.utf16_offset(byte),
+                    utf16_offset(text, byte),
+                    "utf16_offset({byte}) for {text:?}"
+                );
+            }
+            for unit in 0..=(utf16_len + 1) {
+                assert_eq!(
+                    document.byte_offset_for_utf16(unit),
+                    byte_offset_for_utf16(text, unit),
+                    "byte_offset_for_utf16({unit}) for {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn document_utf16_tracks_edits() {
+        let mut document = doc("start\n");
+        assert!(document.insert_text("😀"));
+        assert!(document.replace_range(0, 0, "héllo "));
+        let text = document.text().to_string();
+        let utf16_len = text.encode_utf16().count();
+        for byte in 0..=text.len() {
+            assert_eq!(document.utf16_offset(byte), utf16_offset(&text, byte));
+        }
+        for unit in 0..=(utf16_len + 1) {
+            assert_eq!(
+                document.byte_offset_for_utf16(unit),
+                byte_offset_for_utf16(&text, unit)
+            );
+        }
+    }
+
+    #[test]
+    fn local_word_range_matches_full_scan() {
+        fn reference(text: &str, offset: usize) -> (usize, usize) {
+            let offset = snap_to_grapheme(text, offset);
+            let graphemes: Vec<(usize, usize)> = crate::grapheme::grapheme_ranges(text).collect();
+            if graphemes.is_empty() {
+                return (0, 0);
+            }
+            let class = |start: usize| -> u8 {
+                match text[start..].chars().next() {
+                    Some(c) if c.is_alphanumeric() || c == '_' => 0,
+                    Some(c) if c.is_whitespace() => 1,
+                    _ => 2,
+                }
+            };
+            let index = graphemes
+                .iter()
+                .rposition(|&(start, _)| start <= offset)
+                .unwrap_or(0);
+            let target = class(graphemes[index].0);
+            let mut first = index;
+            while first > 0 && class(graphemes[first - 1].0) == target {
+                first -= 1;
+            }
+            let mut last = index;
+            while last + 1 < graphemes.len() && class(graphemes[last + 1].0) == target {
+                last += 1;
+            }
+            (graphemes[first].0, graphemes[last].1)
+        }
+
+        for text in [
+            "",
+            "foo bar,baz",
+            "  spaced  out ",
+            "e\u{301}x y",
+            "a😀b 😀",
+            "line one\nline two\n",
+            "   \n\t",
+        ] {
+            let document = doc(text);
+            for offset in 0..=(text.len() + 2) {
+                assert_eq!(
+                    document.word_range_at(offset),
+                    reference(text, offset),
+                    "word_range_at({offset}) for {text:?}"
+                );
+            }
+        }
     }
 }

@@ -1,31 +1,161 @@
-//! localStorage autosave for the editor.
+//! Persistence for the editor.
 //!
-//! The key is versioned so the storage format can change without migrations:
-//! an older version is simply ignored and overwritten.
+//! Document text lives in **IndexedDB** so up to the 64 MB cap can be
+//! autosaved (localStorage's ~5–10 MB quota cannot hold that). IndexedDB is
+//! asynchronous, so `load`/`save` are `async` on both targets; the non-wasm
+//! stub returns immediately.
+//!
+//! The tiny, recently-used transform list stays in localStorage: it is well
+//! under quota and synchronous, which keeps the palette snappy.
+//!
+//! Keys are versioned so the storage format can change without migrations: an
+//! older version is ignored and overwritten. The legacy localStorage text key
+//! (`zapslab.text.v1`) is migrated into IndexedDB once on first load.
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    use web_sys::{window, Storage};
+    use std::cell::RefCell;
 
-    const KEY: &str = "zapslab.text.v1";
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{IdbDatabase, IdbFactory, IdbRequest, IdbTransactionMode, Storage, Window};
+
+    const DB_NAME: &str = "zapslab";
+    const DB_VERSION: u32 = 1;
+    const STORE: &str = "documents";
+    const TEXT_KEY: &str = "text.v1";
+    /// Pre-IndexedDB text location, migrated once and then removed.
+    const LEGACY_TEXT_KEY: &str = "zapslab.text.v1";
     /// Most-recently-used transform names, newest first. Versioned like the
     /// text key: an older/malformed value is ignored rather than migrated.
     const RECENT_KEY: &str = "zapslab.recent.v1";
+
+    thread_local! {
+        /// The opened database, reused across reads and writes.
+        static DATABASE: RefCell<Option<IdbDatabase>> = RefCell::new(None);
+    }
+
+    fn window() -> Option<Window> {
+        web_sys::window()
+    }
 
     fn storage() -> Option<Storage> {
         window()?.local_storage().ok().flatten()
     }
 
-    pub fn load() -> Option<String> {
-        storage()?.get_item(KEY).ok().flatten()
+    fn factory() -> Option<IdbFactory> {
+        window()?.indexed_db().ok().flatten()
     }
 
-    /// Persists `text`. Returns `Err(())` when the write fails — for example a
-    /// `QuotaExceededError` on a large document, or storage being unavailable
-    /// or blocked. Callers surface this instead of pretending the save worked.
-    pub fn save(text: &str) -> Result<(), ()> {
-        let storage = storage().ok_or(())?;
-        storage.set_item(KEY, text).map_err(|_| ())
+    /// Bridges an IndexedDB request to a future resolving with its result. The
+    /// callbacks are one-shot, so `once_into_js` frees them after the first
+    /// event instead of leaking them per request.
+    fn request_future(request: &IdbRequest) -> JsFuture {
+        let promise = js_sys::Promise::new(&mut |resolve, reject| {
+            let success = {
+                let request = IdbRequest::clone(request);
+                Closure::once_into_js(move || {
+                    let value = request.result().unwrap_or(JsValue::UNDEFINED);
+                    let _ = resolve.call1(&JsValue::UNDEFINED, &value);
+                })
+            };
+            let failure = Closure::once_into_js(move || {
+                let _ = reject.call1(
+                    &JsValue::UNDEFINED,
+                    &JsValue::from_str("indexeddb request failed"),
+                );
+            });
+            request.set_onsuccess(Some(success.unchecked_ref()));
+            request.set_onerror(Some(failure.unchecked_ref()));
+        });
+        JsFuture::from(promise)
+    }
+
+    async fn open_database() -> Result<IdbDatabase, ()> {
+        let factory = factory().ok_or(())?;
+        let open = factory.open_with_u32(DB_NAME, DB_VERSION).map_err(|_| ())?;
+
+        // Create the object store on first run / schema bump.
+        let upgrade_request = open.clone();
+        let on_upgrade = Closure::<dyn FnMut()>::new(move || {
+            if let Ok(value) = upgrade_request.result() {
+                if let Ok(db) = value.dyn_into::<IdbDatabase>() {
+                    let _ = db.create_object_store(STORE);
+                }
+            }
+        });
+        open.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
+
+        let result = request_future(open.unchecked_ref::<IdbRequest>())
+            .await
+            .map_err(|_| ())?;
+        drop(on_upgrade);
+        result.dyn_into::<IdbDatabase>().map_err(|_| ())
+    }
+
+    async fn database() -> Result<IdbDatabase, ()> {
+        if let Some(database) = DATABASE.with(|slot| slot.borrow().clone()) {
+            return Ok(database);
+        }
+        let database = open_database().await?;
+        DATABASE.with(|slot| *slot.borrow_mut() = Some(database.clone()));
+        Ok(database)
+    }
+
+    async fn read_text() -> Result<Option<String>, ()> {
+        let database = database().await?;
+        let transaction = database
+            .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readonly)
+            .map_err(|_| ())?;
+        let store = transaction.object_store(STORE).map_err(|_| ())?;
+        let request = store.get(&JsValue::from_str(TEXT_KEY)).map_err(|_| ())?;
+        let value = request_future(&request).await.map_err(|_| ())?;
+        if value.is_undefined() || value.is_null() {
+            Ok(None)
+        } else {
+            value.as_string().map(Some).ok_or(())
+        }
+    }
+
+    async fn write_text(text: &str) -> Result<(), ()> {
+        let database = database().await?;
+        let transaction = database
+            .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+            .map_err(|_| ())?;
+        let store = transaction.object_store(STORE).map_err(|_| ())?;
+        let request = store
+            .put_with_key(&JsValue::from_str(text), &JsValue::from_str(TEXT_KEY))
+            .map_err(|_| ())?;
+        request_future(&request).await.map_err(|_| ())?;
+        Ok(())
+    }
+
+    /// Loads the stored document, migrating the legacy localStorage value on
+    /// first run. Returns `None` when nothing is stored or storage is blocked.
+    pub async fn load() -> Option<String> {
+        if let Ok(Some(text)) = read_text().await {
+            return Some(text);
+        }
+
+        let legacy = storage().and_then(|storage| storage.get_item(LEGACY_TEXT_KEY).ok().flatten());
+        if let Some(text) = &legacy {
+            // Only drop the old key once the migration write succeeded, so a
+            // failed write never loses the text.
+            if write_text(text).await.is_ok() {
+                if let Some(storage) = storage() {
+                    let _ = storage.remove_item(LEGACY_TEXT_KEY);
+                }
+            }
+        }
+        legacy
+    }
+
+    /// Persists `text`. Returns `Err(())` when the write fails (quota, storage
+    /// blocked, private mode); callers surface this instead of pretending the
+    /// save worked.
+    pub async fn save(text: &str) -> Result<(), ()> {
+        write_text(text).await
     }
 
     pub fn load_recent() -> Vec<String> {
@@ -45,11 +175,11 @@ mod imp {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    pub fn load() -> Option<String> {
+    pub async fn load() -> Option<String> {
         None
     }
 
-    pub fn save(_text: &str) -> Result<(), ()> {
+    pub async fn save(_text: &str) -> Result<(), ()> {
         Ok(())
     }
 

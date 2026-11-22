@@ -13,7 +13,7 @@
 //!   enter, shortcuts) are handled in `on_key_down`.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::HashMap,
     ops::Range,
     rc::Rc,
@@ -21,7 +21,7 @@ use std::{
 };
 
 use zapslab_document::{
-    Document, byte_offset_for_utf16, display,
+    Document, MAX_DOCUMENT_BYTES, byte_offset_for_utf16, display,
     encoding::{self, Encoding},
     hexdump::HexLayout,
     utf16_offset,
@@ -50,8 +50,14 @@ const MIN_THUMB_WIDTH: f32 = 25.0;
 const LINE_HEIGHT_RATIO: f32 = 1.618;
 /// Fallback advance for the monospace font when the text system has no metric.
 const FALLBACK_ASCII_WIDTH_PX: f32 = 8.0;
-/// localStorage writes are synchronous; coalesce bursts of typing into one write.
+/// Coalesce bursts of typing into one IndexedDB write.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Above this size, copying and writing the document is expensive, so autosave
+/// waits longer to avoid competing with typing.
+const SAVE_LARGE_THRESHOLD: usize = 4 * 1024 * 1024;
+const SAVE_DEBOUNCE_LARGE: Duration = Duration::from_secs(2);
+/// Running an expensive transform over more than this much text asks first.
+const TRANSFORM_CONFIRM_BYTES: usize = 2 * 1024 * 1024;
 /// Keep the recently-used list short enough to scan at a glance.
 const RECENT_TRANSFORMS_MAX: usize = 8;
 /// How long a transient status-bar hint stays visible.
@@ -65,6 +71,12 @@ const HEX_PANEL_MAX_RATIO: f32 = 0.85;
 const HEX_PANEL_DRAG_HANDLE: f32 = 6.0;
 /// Accent color for escaped non-printing characters.
 const NON_PRINTING_COLOR: u32 = 0xf9e2af;
+/// Visual rows rendered above and below the viewport to smooth scrolling.
+const OVERSCAN_ROWS: u32 = 24;
+/// Soft wrap is force-disabled past either bound so row layout stays O(1) per
+/// frame (identity row mapping) and the per-line wrap index stays small.
+const WRAP_DISABLE_BYTES: usize = 8 * 1024 * 1024;
+const WRAP_DISABLE_LINES: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
 struct Metrics {
@@ -73,10 +85,85 @@ struct Metrics {
     ascii_width: Pixels,
 }
 
+/// Per-line soft-wrap layout for a fixed document revision and wrap settings.
+///
+/// `prefix[i]` is the number of visual rows before source line `i`, so it has
+/// `line_count + 1` entries and its final entry is the total row count. The
+/// prefix sums turn "global row -> source line" and back into a binary search
+/// instead of a full scan.
+///
+/// When wrapping is off every line is exactly one row, so `prefix` stays empty
+/// and the mapping is the identity: large documents pay nothing for layout.
+struct WrapLayout {
+    on: bool,
+    revision: u64,
+    wrap_width: f32,
+    show_invisibles: bool,
+    prefix: Vec<u32>,
+}
+
+impl WrapLayout {
+    /// Whether this layout still applies to the app's current document and
+    /// wrap settings.
+    fn matches(&self, app: &Scratchpad) -> bool {
+        if self.on != app.word_wrap {
+            return false;
+        }
+        if !self.on {
+            return true;
+        }
+        self.revision == app.document.revision()
+            && self.show_invisibles == app.show_invisibles
+            // Compare rounded widths so sub-pixel jitter does not rebuild the
+            // whole index on every frame.
+            && self.wrap_width.round() as u32 == app.wrap_width.get().round() as u32
+    }
+
+    fn total_rows(&self, doc: &Document) -> u32 {
+        if self.on {
+            self.prefix.last().copied().unwrap_or(0)
+        } else {
+            doc.line_count() as u32
+        }
+    }
+
+    /// Source line containing visual row `row`.
+    fn line_of_row(&self, row: u32) -> usize {
+        if !self.on {
+            return row as usize;
+        }
+        // `prefix` is strictly increasing (every line has at least one row), so
+        // the last entry `<= row` identifies the line.
+        let index = self.prefix.partition_point(|&start| start <= row);
+        index
+            .saturating_sub(1)
+            .min(self.prefix.len().saturating_sub(2))
+    }
+
+    /// First visual row of source line `line`.
+    fn row_of_line(&self, line: usize) -> u32 {
+        if !self.on {
+            return line as u32;
+        }
+        self.prefix.get(line).copied().unwrap_or(0)
+    }
+}
+
 #[derive(Default)]
 struct Palette {
     query: String,
     selected: usize,
+}
+
+/// An expensive transform waiting for confirmation against a large range.
+/// Offsets are captured when the palette applies; the modal blocks edits until
+/// the user runs or cancels it.
+#[derive(Clone, Copy)]
+struct PendingTransform {
+    index: usize,
+    start: usize,
+    end: usize,
+    keep_selection: bool,
 }
 
 /// Floating palette description, shown by gpui's tooltip machinery when the
@@ -188,6 +275,8 @@ pub struct Scratchpad {
     caret_visible: bool,
     word_wrap: bool,
     palette: Option<Palette>,
+    /// Set when an expensive transform needs confirmation before running.
+    pending_transform: Option<PendingTransform>,
     /// Scroll position of the transform list. Reset when the palette opens or
     /// the query changes; driven by the wheel/trackpad and arrow navigation.
     palette_scroll: ScrollHandle,
@@ -221,10 +310,27 @@ pub struct Scratchpad {
     byte_edit: Option<ByteEdit>,
     scroll_handle: ScrollHandle,
     scroll_drag: Option<ScrollDrag>,
+    /// Active drag on the vertical scrollbar thumb.
+    v_scroll_drag: Option<ScrollDrag>,
     content_width: Cell<f32>,
+    /// Full scrollable content height (pixels), refreshed each render so the
+    /// vertical scrollbar's drag math matches the painted extent.
+    content_height: Cell<f32>,
+    /// Longest source-line display width. Grown incrementally on edits while
+    /// word wrap is off instead of being rescanned every frame;
+    /// `content_width_dirty` forces a full rescan after settings changes or
+    /// whole-document edits (undo/redo).
+    content_max_width: Cell<f32>,
+    content_width_dirty: Cell<bool>,
+    /// Cached soft-wrap layout, rebuilt lazily when the document revision or
+    /// wrap settings change. Interior mutability keeps geometry helpers `&self`.
+    wrap_layout: RefCell<Option<WrapLayout>>,
     /// Debounced autosave: replaced on each edit (dropping the previous task
     /// cancels its timer). Held only so the timer stays alive.
     _save_task: Option<Task<()>>,
+    /// Loads the persisted document from IndexedDB asynchronously; held so the
+    /// task is not cancelled before it resolves.
+    _load_task: Option<Task<()>>,
     /// Whether the most recent autosave attempt failed (shown in the status bar).
     save_failed: bool,
     /// Flushes the pending autosave when focus leaves the editor.
@@ -238,7 +344,10 @@ pub struct Scratchpad {
 
 impl Scratchpad {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let document = Document::new(storage::load().unwrap_or_default());
+        // The document is loaded asynchronously from IndexedDB (see
+        // `_load_task`); start empty and populate it once the load resolves.
+        let document = Document::new(String::new());
+        let word_wrap = true;
 
         let text_system = cx.text_system();
         let font_id = text_system.resolve_font(&font(".ZedMono"));
@@ -261,11 +370,12 @@ impl Scratchpad {
             did_autofocus: false,
             dragging: false,
             caret_visible: true,
-            word_wrap: true,
             palette: None,
+            pending_transform: None,
             palette_scroll: ScrollHandle::default(),
             recent_transforms: storage::load_recent(),
             show_invisibles: true,
+            word_wrap,
             hex_panel: false,
             hex_encoding: Encoding::Utf8,
             hex_panel_width: Cell::new(0.0),
@@ -279,8 +389,27 @@ impl Scratchpad {
             byte_edit: None,
             scroll_handle: ScrollHandle::default(),
             scroll_drag: None,
+            v_scroll_drag: None,
             content_width: Cell::new(0.0),
+            content_height: Cell::new(0.0),
+            content_max_width: Cell::new(0.0),
+            content_width_dirty: Cell::new(true),
+            wrap_layout: RefCell::new(None),
             _save_task: None,
+            _load_task: Some(cx.spawn(async move |this, cx| {
+                let text = storage::load().await;
+                let _ = this.update(&mut *cx, |view, cx| {
+                    // Do not clobber anything the user typed while loading.
+                    if !view.document.is_empty() {
+                        return;
+                    }
+                    view.document = Document::new(text.unwrap_or_default());
+                    view.word_wrap = !view.document_is_large();
+                    view.content_width_dirty.set(true);
+                    view.caret_visible = true;
+                    cx.notify();
+                });
+            })),
             save_failed: false,
             _blur_subscription: None,
             hint: None,
@@ -337,6 +466,12 @@ impl Scratchpad {
         (viewport_width - panel).max(1.0)
     }
 
+    /// Height of the editor area: the viewport minus the status bar (the editor
+    /// and hex panel sit above it).
+    fn editor_height(&self, window: &Window) -> f32 {
+        (f32::from(window.viewport_size().height) - STATUS_BAR_HEIGHT).max(1.0)
+    }
+
     /// Stored hex panel width, defaulted and clamped to the viewport ratios.
     fn hex_panel_width_px(&self, viewport_width: f32) -> f32 {
         let stored = self.hex_panel_width.get();
@@ -372,46 +507,233 @@ impl Scratchpad {
         move |display| self.display_width(display, cx)
     }
 
-    /// Visual rows after soft wrapping: `(source line, start byte, end byte)`.
-    /// Wrapped continuation rows share the same source line; an empty source
-    /// line always yields exactly one (empty) row. Wrapping is measured in
-    /// display width, so escaped invisibles count as the width they are drawn.
-    fn visual_rows(&self, cx: &App) -> Vec<(usize, usize, usize)> {
+    /// Borrow the cached wrap layout, rebuilding it first if the document
+    /// revision or wrap settings changed. The cache lives behind `RefCell` so
+    /// the geometry helpers can stay `&self`.
+    fn wrap_layout(&self, cx: &App) -> Ref<'_, WrapLayout> {
+        let stale = match self.wrap_layout.borrow().as_ref() {
+            Some(layout) => !layout.matches(self),
+            None => true,
+        };
+        if stale {
+            let layout = self.compute_wrap_layout(cx);
+            *self.wrap_layout.borrow_mut() = Some(layout);
+        }
+        Ref::map(self.wrap_layout.borrow(), |slot| {
+            slot.as_ref().expect("wrap layout was just ensured")
+        })
+    }
+
+    /// Build the per-line wrap index. When wrapping is on this scans every line
+    /// once (`wrap_count` does not allocate); when it is off it is a no-op.
+    fn compute_wrap_layout(&self, cx: &App) -> WrapLayout {
+        if !self.word_wrap {
+            return WrapLayout {
+                on: false,
+                revision: self.document.revision(),
+                wrap_width: f32::INFINITY,
+                show_invisibles: self.show_invisibles,
+                prefix: Vec::new(),
+            };
+        }
+
         let wrap_width = self.wrap_width.get();
         let text = self.document.text();
         let width_of = self.width_fn(cx);
-        let mut rows = Vec::new();
-
+        let mut prefix = Vec::with_capacity(self.document.line_count() + 1);
+        prefix.push(0u32);
+        let mut total = 0u32;
         for line in 0..self.document.line_count() {
             let (start, end) = self.document.line_range(line);
-            for (chunk_start, chunk_end) in display::wrap_line(
+            let count = display::wrap_count(
                 text,
                 start,
                 end,
                 wrap_width,
                 self.show_invisibles,
                 &width_of,
-            ) {
-                rows.push((line, chunk_start, chunk_end));
-            }
+            ) as u32;
+            total = total.saturating_add(count);
+            prefix.push(total);
         }
 
-        if rows.is_empty() {
-            rows.push((0, 0, 0));
+        WrapLayout {
+            on: true,
+            revision: self.document.revision(),
+            wrap_width,
+            show_invisibles: self.show_invisibles,
+            prefix,
+        }
+    }
+
+    /// Inclusive range of visual rows currently in (and just around) the
+    /// viewport, derived from the scroll offset and the uniform row height.
+    fn visible_window(&self, layout: &WrapLayout, viewport_height: f32) -> (u32, u32) {
+        let line_height = f32::from(self.metrics.line_height);
+        let total = layout.total_rows(&self.document);
+        let scroll_top = (-f32::from(self.scroll_handle.offset().y)).max(0.0);
+        let first = ((scroll_top / line_height).floor() as u32).min(total.saturating_sub(1));
+        let count = (viewport_height / line_height).ceil() as u32 + 2 * OVERSCAN_ROWS;
+        let last = first.saturating_add(count).min(total.saturating_sub(1));
+        (first, last)
+    }
+
+    /// Resolve the visible rows to `(global row, source line, start, end)`.
+    ///
+    /// Rows are grouped by source line so `wrap_line` runs once per line rather
+    /// than once per row — important for a single long wrapped line.
+    fn visible_row_ranges(
+        &self,
+        layout: &WrapLayout,
+        first: u32,
+        last: u32,
+        cx: &App,
+    ) -> Vec<(u32, usize, usize, usize)> {
+        let text = self.document.text();
+        let width_of = self.width_fn(cx);
+        let mut rows = Vec::with_capacity((last.saturating_sub(first) as usize) + 1);
+
+        let first_line = layout.line_of_row(first);
+        let last_line = layout.line_of_row(last);
+        for line in first_line..=last_line {
+            let (start, end) = self.document.line_range(line);
+            let base = layout.row_of_line(line);
+            if layout.on {
+                for (index, (chunk_start, chunk_end)) in display::wrap_line(
+                    text,
+                    start,
+                    end,
+                    layout.wrap_width,
+                    layout.show_invisibles,
+                    &width_of,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    let row = base + index as u32;
+                    if row >= first && row <= last {
+                        rows.push((row, line, chunk_start, chunk_end));
+                    }
+                }
+            } else {
+                rows.push((base, line, start, end));
+            }
         }
         rows
     }
 
-    fn visual_row_of_offset(&self, rows: &[(usize, usize, usize)], offset: usize) -> usize {
-        // A document always yields at least one row (an empty document is one
-        // empty row), so indexing the result is safe.
-        debug_assert!(!rows.is_empty(), "visual_rows must never be empty");
-        // The last row whose start is at or before the offset. This resolves
-        // wrap boundaries to the continuation row, line ends to the row that
-        // actually contains the cursor, empty rows, and end-of-document.
-        rows.iter()
-            .rposition(|&(_, start, _)| start <= offset)
-            .unwrap_or_else(|| rows.len().saturating_sub(1))
+    /// `(source line, start byte, end byte)` for a single visual row.
+    fn row_at(&self, layout: &WrapLayout, cx: &App, index: u32) -> (usize, usize, usize) {
+        let line = layout.line_of_row(index);
+        let (start, end) = self.document.line_range(line);
+        if !layout.on {
+            return (line, start, end);
+        }
+        let chunk = index.saturating_sub(layout.row_of_line(line)) as usize;
+        display::wrap_line(
+            self.document.text(),
+            start,
+            end,
+            layout.wrap_width,
+            layout.show_invisibles,
+            &self.width_fn(cx),
+        )
+        .get(chunk)
+        .map(|&(chunk_start, chunk_end)| (line, chunk_start, chunk_end))
+        .unwrap_or((line, start, end))
+    }
+
+    /// Global visual row containing byte `offset`.
+    fn row_of_offset(&self, layout: &WrapLayout, offset: usize, cx: &App) -> u32 {
+        let line = self.document.line_of_offset(offset);
+        let base = layout.row_of_line(line);
+        if !layout.on {
+            return base;
+        }
+        let (start, end) = self.document.line_range(line);
+        let chunk = display::wrap_line(
+            self.document.text(),
+            start,
+            end,
+            layout.wrap_width,
+            layout.show_invisibles,
+            &self.width_fn(cx),
+        )
+        .iter()
+        .rposition(|&(chunk_start, _)| chunk_start <= offset)
+        .unwrap_or(0);
+        base + chunk as u32
+    }
+
+    /// Build one rendered row element from a display byte range.
+    fn row_element(&self, start: usize, end: usize) -> AnyElement {
+        let text = self.document.text();
+        let mut display_text = String::new();
+        let mut escaped_runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let mut escaped_start: Option<usize> = None;
+
+        for grapheme in display::display_graphemes(&text[start..end], self.show_invisibles) {
+            if grapheme.escaped {
+                escaped_start.get_or_insert(display_text.len());
+            } else if let Some(run_start) = escaped_start.take() {
+                escaped_runs.push((
+                    run_start..display_text.len(),
+                    HighlightStyle {
+                        color: Some(rgb(NON_PRINTING_COLOR).into()),
+                        ..Default::default()
+                    },
+                ));
+            }
+            display_text.push_str(&grapheme.display);
+        }
+        if let Some(run_start) = escaped_start {
+            escaped_runs.push((
+                run_start..display_text.len(),
+                HighlightStyle {
+                    color: Some(rgb(NON_PRINTING_COLOR).into()),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        div()
+            .h(px(f32::from(self.metrics.line_height)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .whitespace_nowrap()
+            .child(StyledText::new(display_text).with_highlights(escaped_runs))
+            .into_any_element()
+    }
+
+    /// Longest line's display width across the whole document. Used only when
+    /// the incremental max is invalidated and a full rescan is required.
+    fn measure_all_line_widths(&self, cx: &App) -> f32 {
+        let mut max = 0.0f32;
+        for line in 0..self.document.line_count() {
+            let (start, end) = self.document.line_range(line);
+            max = max.max(f32::from(self.x_in_row(start, end, cx)));
+        }
+        max
+    }
+
+    /// Grow the cached longest-line width by measuring the lines touched by an
+    /// edit. Deletions do not shrink it (a slightly wide scroll extent is
+    /// harmless and the next full rescan corrects it).
+    fn grow_content_width_around(&self, start: usize, end: usize, cx: &App) {
+        let last_line = self.document.line_count().saturating_sub(1);
+        let first = self.document.line_of_offset(start).min(last_line);
+        let last = self.document.line_of_offset(end).min(last_line);
+        let mut max = self.content_max_width.get();
+        for line in first..=last {
+            let (line_start, line_end) = self.document.line_range(line);
+            max = max.max(f32::from(self.x_in_row(line_start, line_end, cx)));
+        }
+        self.content_max_width.set(max);
+    }
+
+    fn document_is_large(&self) -> bool {
+        self.document.len() > WRAP_DISABLE_BYTES || self.document.line_count() > WRAP_DISABLE_LINES
     }
 
     fn x_in_row(&self, start: usize, offset: usize, cx: &App) -> Pixels {
@@ -445,10 +767,11 @@ impl Scratchpad {
     ) -> usize {
         let relative_x = (f32::from(position.x) - f32::from(bounds.origin.x) - PAD).max(0.0);
         let relative_y = (f32::from(position.y) - f32::from(bounds.origin.y) - PAD).max(0.0);
-        let rows = self.visual_rows(cx);
-        let row_index = ((relative_y / f32::from(self.metrics.line_height)).floor() as usize)
-            .min(rows.len().saturating_sub(1));
-        let (_, start, end) = rows[row_index];
+        let line_height = f32::from(self.metrics.line_height);
+        let layout = self.wrap_layout(cx);
+        let total = layout.total_rows(&self.document);
+        let row = ((relative_y / line_height).floor() as u32).min(total.saturating_sub(1));
+        let (_, start, end) = self.row_at(&layout, cx, row);
         self.offset_for_x_in_row(start, end, px(relative_x), cx)
     }
 
@@ -456,9 +779,9 @@ impl Scratchpad {
     /// stay in sync with the caret painted in `paint_selection_and_caret`: both
     /// use a full line-height bar at `PAD + line_height * row`.
     fn caret_bounds(&self, offset: usize, bounds: Bounds<Pixels>, cx: &App) -> Bounds<Pixels> {
-        let rows = self.visual_rows(cx);
-        let row_index = self.visual_row_of_offset(&rows, offset);
-        let (_, start, _) = rows[row_index];
+        let layout = self.wrap_layout(cx);
+        let row_index = self.row_of_offset(&layout, offset, cx);
+        let (_, start, _) = self.row_at(&layout, cx, row_index);
         let x = f32::from(self.x_in_row(start, offset, cx));
         let line_height = f32::from(self.metrics.line_height);
         let y = line_height * row_index as f32;
@@ -475,8 +798,20 @@ impl Scratchpad {
 
     fn after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.caret_visible = true;
+        self.maybe_disable_wrap(cx);
         self.custom_after_edit(window, cx);
         cx.notify();
+    }
+
+    /// Force soft wrap off once the document is large enough that per-line wrap
+    /// layout would be costly. The status-bar toggle refuses to re-enable it
+    /// while the document stays large (`on_mouse_down` on the toggle).
+    fn maybe_disable_wrap(&mut self, cx: &mut Context<Self>) {
+        if self.word_wrap && self.document_is_large() {
+            self.word_wrap = false;
+            self.content_width_dirty.set(true);
+            self.show_hint("Wrap disabled for large file", cx);
+        }
     }
 
     fn custom_after_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -484,21 +819,64 @@ impl Scratchpad {
         window.notify_text_input_changed(&self.focus_handle);
     }
 
-    /// Coalesces bursts of edits into one debounced localStorage write. The
+    /// Coalesces bursts of edits into one debounced IndexedDB write. The
     /// previous timer is cancelled by replacing `_save_task`, so only the last
     /// edit in a burst actually persists.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        let debounce = if self.document.len() > SAVE_LARGE_THRESHOLD {
+            SAVE_DEBOUNCE_LARGE
+        } else {
+            SAVE_DEBOUNCE
+        };
         self._save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            let _ = this.update(&mut *cx, |view, cx| view.flush_save(cx));
+            cx.background_executor().timer(debounce).await;
+            // Copy the text only once the debounce fires, not on every keystroke.
+            let Ok(text) = this.update(&mut *cx, |view, _cx| view.document.text().to_string())
+            else {
+                return;
+            };
+            let failed = storage::save(&text).await.is_err();
+            let _ = this.update(&mut *cx, |view, cx| {
+                view.save_failed = failed;
+                cx.notify();
+            });
         }));
     }
 
-    /// Writes the document immediately and records whether it failed, so the
-    /// status bar can tell the user their text was not saved.
+    /// Flushes the pending autosave immediately (e.g. when focus leaves), so a
+    /// debounced edit is never lost.
     fn flush_save(&mut self, cx: &mut Context<Self>) {
-        self.save_failed = storage::save(self.document.text()).is_err();
-        cx.notify();
+        let text = self.document.text().to_string();
+        self._save_task = Some(cx.spawn(async move |this, cx| {
+            let failed = storage::save(&text).await.is_err();
+            let _ = this.update(&mut *cx, |view, cx| {
+                view.save_failed = failed;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Refuse an edit that would push the document past the size cap. The paste
+    /// path checks the pasted chunk itself first (with its own message) before
+    /// reaching this; everything else reports the generic limit here.
+    fn accept_insert_len(
+        &mut self,
+        start: usize,
+        end: usize,
+        insert_len: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let replaced = end.saturating_sub(start);
+        let resulting = self
+            .document
+            .len()
+            .saturating_sub(replaced)
+            .saturating_add(insert_len);
+        if resulting <= MAX_DOCUMENT_BYTES {
+            return true;
+        }
+        self.show_hint("Document limit reached (64 MB).", cx);
+        false
     }
 
     fn replace_range(
@@ -509,7 +887,13 @@ impl Scratchpad {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.accept_insert_len(start, end, insert.len(), cx) {
+            return false;
+        }
         if self.document.replace_range(start, end, insert) {
+            if !self.word_wrap {
+                self.grow_content_width_around(start, self.document.cursor(), cx);
+            }
             self.after_edit(window, cx);
             true
         } else {
@@ -539,7 +923,14 @@ impl Scratchpad {
     }
 
     fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.document.selection_range();
+        if !self.accept_insert_len(start, end, text.len(), cx) {
+            return;
+        }
         if self.document.insert_text(text) {
+            if !self.word_wrap {
+                self.grow_content_width_around(start, self.document.cursor(), cx);
+            }
             self.after_edit(window, cx);
         }
     }
@@ -575,15 +966,18 @@ impl Scratchpad {
     }
 
     fn move_line(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
-        let rows = self.visual_rows(cx);
         let cursor = self.document.cursor();
-        let current = self.visual_row_of_offset(&rows, cursor);
-        let (_, row_start, _) = rows[current];
-        let x = self.x_in_row(row_start, cursor, cx);
-        let target =
-            (current as isize + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize;
-        let (_, start, end) = rows[target];
-        let offset = self.offset_for_x_in_row(start, end, x, cx);
+        let offset = {
+            let layout = self.wrap_layout(cx);
+            let total = layout.total_rows(&self.document);
+            let current = self.row_of_offset(&layout, cursor, cx);
+            let (_, row_start, _) = self.row_at(&layout, cx, current);
+            let x = self.x_in_row(row_start, cursor, cx);
+            let target =
+                (current as i64 + delta as i64).clamp(0, total.saturating_sub(1) as i64) as u32;
+            let (_, start, end) = self.row_at(&layout, cx, target);
+            self.offset_for_x_in_row(start, end, x, cx)
+        };
         self.set_cursor(offset, extend, cx);
     }
 
@@ -628,12 +1022,16 @@ impl Scratchpad {
 
     fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.document.undo() {
+            // Undo replaces the text wholesale, so the incremental width max is
+            // no longer trustworthy.
+            self.content_width_dirty.set(true);
             self.after_edit(window, cx);
         }
     }
 
     fn redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.document.redo() {
+            self.content_width_dirty.set(true);
             self.after_edit(window, cx);
         }
     }
@@ -686,6 +1084,16 @@ impl Scratchpad {
                     }
                     return false;
                 }
+            }
+            return true;
+        }
+
+        // The transform confirmation is modal: Enter runs it, Escape cancels.
+        if self.pending_transform.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => self.cancel_pending_transform(window, cx),
+                "enter" => self.confirm_pending_transform(window, cx),
+                _ => {}
             }
             return true;
         }
@@ -889,28 +1297,44 @@ impl Scratchpad {
             }
         };
 
+        // A heavy transform over a big range can block the UI for a while;
+        // confirm first instead of appearing to hang.
+        if transforms::is_expensive(&transform)
+            && end.saturating_sub(start) > TRANSFORM_CONFIRM_BYTES
+        {
+            self.palette = None;
+            self.pending_transform = Some(PendingTransform {
+                index,
+                start,
+                end,
+                keep_selection: has_selection,
+            });
+            cx.notify();
+            return;
+        }
+
+        self.run_transform(index, start, end, has_selection, window, cx);
+    }
+
+    /// Runs a transform over `start..end` (already resolved from its scope).
+    fn run_transform(
+        &mut self,
+        index: usize,
+        start: usize,
+        end: usize,
+        keep_selection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let transform = transforms::TRANSFORMS[index];
         let result = (transform.apply)(&self.document.text()[start..end]);
         self.palette = None;
         match result {
             transforms::TransformResult::Replace(text) => {
-                self.replace_range_keeping_selection(
-                    start,
-                    end,
-                    &text,
-                    has_selection,
-                    window,
-                    cx,
-                );
+                self.replace_range_keeping_selection(start, end, &text, keep_selection, window, cx);
             }
             transforms::TransformResult::ReplaceAndReport { text, message } => {
-                self.replace_range_keeping_selection(
-                    start,
-                    end,
-                    &text,
-                    has_selection,
-                    window,
-                    cx,
-                );
+                self.replace_range_keeping_selection(start, end, &text, keep_selection, window, cx);
                 self.show_hint(message, cx);
             }
             transforms::TransformResult::Report(message) => {
@@ -920,6 +1344,27 @@ impl Scratchpad {
                 self.show_hint(message, cx);
             }
         }
+        cx.notify();
+    }
+
+    /// Confirms the pending expensive transform (Enter or the Run button).
+    fn confirm_pending_transform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_transform.take() {
+            self.run_transform(
+                pending.index,
+                pending.start,
+                pending.end,
+                pending.keep_selection,
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Dismisses the pending transform without running it.
+    fn cancel_pending_transform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_transform = None;
+        window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
 
@@ -1020,6 +1465,77 @@ impl Scratchpad {
         self.update_scroll_drag(position.x, window, cx);
     }
 
+    fn update_v_scroll_drag(
+        &mut self,
+        position_y: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(drag) = self.v_scroll_drag else {
+            return false;
+        };
+        // Recompute geometry from the current frame rather than trusting the
+        // values captured when the drag started (window may have resized).
+        let editor_height = self.editor_height(window);
+        let content_height = self.content_height.get();
+        let overflow = (content_height - editor_height).max(0.0);
+        if !overflow.is_finite() || overflow <= 0.0 {
+            self.v_scroll_drag = None;
+            return false;
+        }
+        let track_height = (editor_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+        let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+        let thumb_height =
+            (track_height * editor_height / content_height).clamp(min_thumb, track_height);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel <= 0.0 {
+            self.v_scroll_drag = None;
+            return false;
+        }
+        let fraction = ((position_y - drag.grab - SCROLLBAR_MARGIN) / travel).clamp(0.0, 1.0);
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle
+            .set_offset(point(offset.x, px(-fraction * overflow)));
+        cx.notify();
+        true
+    }
+
+    fn begin_v_scroll_drag(
+        &mut self,
+        position: Point<Pixels>,
+        centered: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Never let a scrollbar click reach the text handlers.
+        cx.stop_propagation();
+        self.dragging = false;
+
+        let editor_height = self.editor_height(window);
+        let content_height = self.content_height.get();
+        let overflow = (content_height - editor_height).max(0.0);
+        if !overflow.is_finite() || overflow <= 0.0 {
+            return;
+        }
+        let track_height = (editor_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+        let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+        let thumb_height =
+            (track_height * editor_height / content_height).clamp(min_thumb, track_height);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel <= 0.0 {
+            return;
+        }
+        let grab = if centered {
+            thumb_height / 2.0
+        } else {
+            let offset_y = (-f32::from(self.scroll_handle.offset().y)).clamp(0.0, overflow);
+            let thumb_top = SCROLLBAR_MARGIN + (offset_y / overflow) * travel;
+            f32::from(position.y) - thumb_top
+        };
+        self.v_scroll_drag = Some(ScrollDrag { grab });
+        self.update_v_scroll_drag(f32::from(position.y), window, cx);
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1030,6 +1546,7 @@ impl Scratchpad {
         // A new press always ends any scrollbar drag (the previous release may
         // have happened outside the editor).
         self.scroll_drag = None;
+        self.v_scroll_drag = None;
         if let Some(bounds) = self.last_bounds.get() {
             let offset = self.document.clamp_boundary(self.offset_for_window_point(
                 event.position,
@@ -1066,6 +1583,13 @@ impl Scratchpad {
             self.update_scroll_drag(event.position.x, _window, cx);
             return;
         }
+        if self.v_scroll_drag.is_some() && !event.dragging() {
+            self.v_scroll_drag = None;
+        }
+        if self.v_scroll_drag.is_some() {
+            self.update_v_scroll_drag(f32::from(event.position.y), _window, cx);
+            return;
+        }
         if !self.dragging || self.palette.is_some() {
             return;
         }
@@ -1091,6 +1615,7 @@ impl Scratchpad {
     fn on_mouse_up(&mut self) {
         self.dragging = false;
         self.scroll_drag = None;
+        self.v_scroll_drag = None;
     }
 
     // ---- Hex panel ------------------------------------------------------
@@ -1402,11 +1927,15 @@ impl Scratchpad {
         let line_height = f32::from(self.metrics.line_height);
         let origin_x = f32::from(bounds.origin.x) + PAD;
         let origin_y = f32::from(bounds.origin.y) + PAD;
-        let rows = self.visual_rows(cx);
+
+        // Only rows in the viewport need painting overlay rectangles.
+        let layout = self.wrap_layout(cx);
+        let (first, last) = self.visible_window(&layout, f32::from(window.viewport_size().height));
+        let ranges = self.visible_row_ranges(&layout, first, last, cx);
 
         let (selection_start, selection_end) = self.document.selection_range();
         if selection_start != selection_end {
-            for (row_index, &(line, start, end)) in rows.iter().enumerate() {
+            for &(row_index, line, start, end) in &ranges {
                 let (_, line_end) = self.document.line_range(line);
                 let sel_start = selection_start.max(start).min(end);
                 let sel_end = selection_end.min(end).max(start);
@@ -1433,15 +1962,18 @@ impl Scratchpad {
         }
 
         let cursor = self.document.cursor();
-        let row_index = self.visual_row_of_offset(&rows, cursor);
-        let (_, row_start, _) = rows[row_index];
+        let caret_row = self.row_of_offset(&layout, cursor, cx);
+        if caret_row < first || caret_row > last {
+            return;
+        }
+        let (_, row_start, _) = self.row_at(&layout, cx, caret_row);
         let caret_x = origin_x + f32::from(self.x_in_row(row_start, cursor, cx));
         if !self.caret_visible {
             return;
         }
         // Full row height, like Zed's editor caret: glyphs are centered in the
         // line box, so a full-height bar lines up at any font size.
-        let caret_y = origin_y + line_height * row_index as f32;
+        let caret_y = origin_y + line_height * caret_row as f32;
         let caret = Bounds {
             origin: point(px(caret_x), px(caret_y)),
             size: size(px(CARET_WIDTH), px(line_height)),
@@ -1645,11 +2177,10 @@ impl EntityInputHandler for Scratchpad {
             *adjusted_range = Some(utf16_offset(query, start)..utf16_offset(query, end));
             return Some(query[start..end].to_string());
         }
-        let text = self.document.text();
-        let start = byte_offset_for_utf16(text, range_utf16.start);
-        let end = byte_offset_for_utf16(text, range_utf16.end);
-        *adjusted_range = Some(utf16_offset(text, start)..utf16_offset(text, end));
-        Some(text[start..end].to_string())
+        let start = self.document.byte_offset_for_utf16(range_utf16.start);
+        let end = self.document.byte_offset_for_utf16(range_utf16.end);
+        *adjusted_range = Some(self.document.utf16_offset(start)..self.document.utf16_offset(end));
+        Some(self.document.text()[start..end].to_string())
     }
 
     fn selected_text_range(
@@ -1666,9 +2197,8 @@ impl EntityInputHandler for Scratchpad {
             });
         }
         let (start, end) = self.document.selection_range();
-        let text = self.document.text();
         Some(UTF16Selection {
-            range: utf16_offset(text, start)..utf16_offset(text, end),
+            range: self.document.utf16_offset(start)..self.document.utf16_offset(end),
             reversed: self.document.cursor() < self.document.anchor(),
         })
     }
@@ -1692,6 +2222,10 @@ impl EntityInputHandler for Scratchpad {
     ) {
         // The encoding prompt is modal; ignore IME/paste input while it is up.
         if self.encoding_prompt.is_some() {
+            return;
+        }
+        // The transform confirmation is modal; ignore input while it is up.
+        if self.pending_transform.is_some() {
             return;
         }
         // Route typing to the inline byte editor when it is open.
@@ -1721,10 +2255,16 @@ impl EntityInputHandler for Scratchpad {
             cx.notify();
             return;
         }
+        // A single chunk larger than the cap is a too-large paste; refuse it
+        // outright with the paste-specific message before doing any work.
+        if text.len() > MAX_DOCUMENT_BYTES {
+            self.show_hint("Attempted paste was too large.", cx);
+            return;
+        }
         let (start, end) = match replacement_range {
             Some(range) => (
-                byte_offset_for_utf16(self.document.text(), range.start),
-                byte_offset_for_utf16(self.document.text(), range.end),
+                self.document.byte_offset_for_utf16(range.start),
+                self.document.byte_offset_for_utf16(range.end),
             ),
             None => self.document.selection_range(),
         };
@@ -1754,7 +2294,7 @@ impl EntityInputHandler for Scratchpad {
         if self.palette.is_some() {
             return None;
         }
-        let offset = byte_offset_for_utf16(self.document.text(), range_utf16.end);
+        let offset = self.document.byte_offset_for_utf16(range_utf16.end);
         Some(self.caret_bounds(offset, element_bounds, cx))
     }
 
@@ -1769,7 +2309,7 @@ impl EntityInputHandler for Scratchpad {
         }
         let bounds = self.last_bounds.get()?;
         let offset = self.offset_for_window_point(position, bounds, cx);
-        Some(utf16_offset(self.document.text(), offset))
+        Some(self.document.utf16_offset(offset))
     }
 }
 
@@ -1814,19 +2354,38 @@ impl Render for Scratchpad {
         });
 
         let line_height = f32::from(self.metrics.line_height);
-        let row_ranges = self.visual_rows(cx);
-        // With wrapping off there is no scroll extent unless the content is
-        // given an explicit width, so size it to the longest row.
+
+        // With wrapping off the content needs an explicit width for the
+        // horizontal scroll extent. The longest line is cached grow-only and
+        // only fully rescanned when the wrap settings change or undo/redo
+        // replaces the text, so large documents are not measured every frame.
         let content_width = if self.word_wrap {
             None
         } else {
-            let mut max = 0.0f32;
-            for &(_, start, end) in &row_ranges {
-                max = max.max(f32::from(self.x_in_row(start, end, cx)));
+            if self.content_width_dirty.get() {
+                let max = self.measure_all_line_widths(cx);
+                self.content_max_width.set(max);
+                self.content_width_dirty.set(false);
             }
-            Some(max + 2.0 * PAD + 24.0)
+            Some(self.content_max_width.get() + 2.0 * PAD + 24.0)
         };
         self.content_width.set(content_width.unwrap_or(0.0));
+
+        // Only the rows in (and just around) the viewport are materialized. The
+        // wrap index is cached against the document revision and wrap settings,
+        // so per-frame work is O(visible), not O(document).
+        let viewport_height = f32::from(viewport.height);
+        let layout = self.wrap_layout(cx);
+        let total_rows = layout.total_rows(&self.document);
+        let (first_visible, last_visible) = self.visible_window(&layout, viewport_height);
+        let total_height = total_rows as f32 * line_height + 2.0 * PAD;
+        let top_spacer = first_visible as f32 * line_height;
+        let bottom_spacer =
+            total_rows.saturating_sub(last_visible).saturating_sub(1) as f32 * line_height;
+        let visible_row_ranges = self.visible_row_ranges(&layout, first_visible, last_visible, cx);
+        drop(layout);
+        // The vertical scrollbar's drag math reads the painted extent back.
+        self.content_height.set(total_height);
 
         // Rebuild the hex layout for this frame. The row length is derived from
         // the panel width so the bytes fill the pane, and the layout is reused by
@@ -1843,56 +2402,13 @@ impl Render for Scratchpad {
         };
         self.hex_layout = hex_layout;
 
-        // Shape each visual row as a single text element. Splitting a row into
-        // one flex item per run makes gpui measure each item to a whole pixel;
-        // those roundings accumulate, so the caret and selection overlay drift
-        // further right with every escaped run. A single `StyledText` shapes the
-        // row once and only recolors escapes via highlights, so glyph positions
-        // stay exact and the overlay math lines up with the drawn text.
-        let rows: Vec<AnyElement> = {
-            let text = self.document.text();
-            row_ranges
-                .iter()
-                .map(|&(_, start, end)| {
-                    let mut display_text = String::new();
-                    let mut escaped_runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-                    let mut escaped_start: Option<usize> = None;
-                    for grapheme in
-                        display::display_graphemes(&text[start..end], self.show_invisibles)
-                    {
-                        if grapheme.escaped {
-                            escaped_start.get_or_insert(display_text.len());
-                        } else if let Some(run_start) = escaped_start.take() {
-                            escaped_runs.push((
-                                run_start..display_text.len(),
-                                HighlightStyle {
-                                    color: Some(rgb(NON_PRINTING_COLOR).into()),
-                                    ..Default::default()
-                                },
-                            ));
-                        }
-                        display_text.push_str(&grapheme.display);
-                    }
-                    if let Some(run_start) = escaped_start {
-                        escaped_runs.push((
-                            run_start..display_text.len(),
-                            HighlightStyle {
-                                color: Some(rgb(NON_PRINTING_COLOR).into()),
-                                ..Default::default()
-                            },
-                        ));
-                    }
-                    div()
-                        .h(px(line_height))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .whitespace_nowrap()
-                        .child(StyledText::new(display_text).with_highlights(escaped_runs))
-                        .into_any_element()
-                })
-                .collect()
-        };
+        // Shape each visible row as a single text element (see `row_element` for
+        // why a single `StyledText` keeps the overlay geometry exact). Only the
+        // viewport's rows are built.
+        let rows: Vec<AnyElement> = visible_row_ranges
+            .iter()
+            .map(|&(_, _, start, end)| self.row_element(start, end))
+            .collect();
 
         // gpui does not draw scrollbars for overflow containers, so when word
         // wrap is off we render (and drag) our own horizontal one.
@@ -1957,6 +2473,68 @@ impl Render for Scratchpad {
             }
         };
 
+        // gpui draws no scrollbars, so we render (and drag) a vertical one too.
+        // It tracks scroll extent for both wrapped and unwrapped modes.
+        let v_scrollbar = {
+            let editor_height = (viewport_height - STATUS_BAR_HEIGHT).max(1.0);
+            let overflow = (total_height - editor_height).max(0.0);
+            if overflow > 0.0 && total_height.is_finite() {
+                let track_height = (editor_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+                let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+                let thumb_height =
+                    (track_height * editor_height / total_height).clamp(min_thumb, track_height);
+                let travel = (track_height - thumb_height).max(0.0);
+                let offset_y = (-f32::from(self.scroll_handle.offset().y)).clamp(0.0, overflow);
+                let thumb_top = SCROLLBAR_MARGIN + (offset_y / overflow) * travel;
+                Some(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .child(
+                            div()
+                                .w(px(SCROLLBAR_HEIGHT))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.begin_v_scroll_drag(event.position, true, window, cx);
+                                    }),
+                                )
+                                .child(div().w(px(6.0)).h(px(thumb_top)))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(thumb_height))
+                                        .bg(rgb(0x45475a))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    this.begin_v_scroll_drag(
+                                                        event.position,
+                                                        false,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        ),
+                                ),
+                        ),
+                )
+            } else {
+                None
+            }
+        };
+
         let weak_view = cx.entity().downgrade();
         let focus_handle = self.focus_handle.clone();
         let bounds_cell = self.last_bounds.clone();
@@ -1998,7 +2576,9 @@ impl Render for Scratchpad {
             scroll.overflow_x_scroll()
         };
 
-        let content = div().relative();
+        // The content carries the full scroll extent; only the visible rows sit
+        // inside it, offset by spacers so scrolling stays pixel-exact.
+        let content = div().relative().h(px(total_height));
         let content = if let Some(width) = content_width {
             content.w(px(width))
         } else {
@@ -2047,7 +2627,14 @@ impl Render for Scratchpad {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
+                                    // Large documents stay wrap-off: the per-line
+                                    // wrap index would be costly to maintain.
+                                    if !this.word_wrap && this.document_is_large() {
+                                        this.show_hint("Wrap disabled for large file", cx);
+                                        return;
+                                    }
                                     this.word_wrap = !this.word_wrap;
+                                    this.content_width_dirty.set(true);
                                     cx.notify();
                                 }),
                             )
@@ -2070,6 +2657,9 @@ impl Render for Scratchpad {
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
                                     this.show_invisibles = !this.show_invisibles;
+                                    // Escape widths change, so the longest-line
+                                    // extent must be rescanned.
+                                    this.content_width_dirty.set(true);
                                     cx.notify();
                                 }),
                             )
@@ -2410,6 +3000,90 @@ impl Render for Scratchpad {
                 )
         });
 
+        let pending_overlay = self.pending_transform.map(|pending| {
+            let transform = &transforms::TRANSFORMS[pending.index];
+            let mb = pending.end.saturating_sub(pending.start) as f64 / (1024.0 * 1024.0);
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        // Clicking the dimmed backdrop cancels, like Esc.
+                        this.pending_transform = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(440.0))
+                        .p(px(12.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        // Keep clicks on the dialog from bubbling to the backdrop.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(div().text_color(rgb(0xf5e0dc)).child("Large transform"))
+                        .child(div().mt(px(6.0)).text_color(rgb(0xcdd6f4)).child(format!(
+                            "{} operates on {:.1} MB and may take a while.",
+                            transform.name,
+                            mb.max(0.0),
+                        )))
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0xa6adc8))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.cancel_pending_transform(window, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x11111b))
+                                        .bg(rgb(0x94e2d5))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.confirm_pending_transform(window, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child("Run"),
+                                ),
+                        ),
+                )
+        });
+
         let hex_side = if self.hex_panel {
             Some(
                 div()
@@ -2476,12 +3150,15 @@ impl Render for Scratchpad {
                                 .whitespace_nowrap()
                                 .flex()
                                 .flex_col()
-                                .children(rows),
+                                .child(div().h(px(top_spacer)))
+                                .children(rows)
+                                .child(div().h(px(bottom_spacer))),
                         )
                         .child(overlay),
                 ),
             )
-            .children(h_scrollbar);
+            .children(h_scrollbar)
+            .children(v_scrollbar);
 
         let content_row = div()
             .flex_1()
@@ -2517,5 +3194,6 @@ impl Render for Scratchpad {
             .children(palette_overlay)
             .children(encoding_overlay)
             .children(byte_edit_overlay)
+            .children(pending_overlay)
     }
 }

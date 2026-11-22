@@ -68,6 +68,33 @@ pub fn wrap_line<F: Fn(&str) -> f32>(
     rows
 }
 
+/// Number of wrapped rows `text[start..end]` occupies at `wrap_width`.
+///
+/// Matches [`wrap_line`] exactly (always at least one row) but counts without
+/// allocating the chunk list, so a full-document wrap index can be built in one
+/// pass without per-line allocations.
+pub fn wrap_count<F: Fn(&str) -> f32>(
+    text: &str,
+    start: usize,
+    end: usize,
+    wrap_width: f32,
+    escape_invisibles: bool,
+    width_of: &F,
+) -> usize {
+    let mut count = 1usize;
+    let mut chunk_width = 0.0f32;
+
+    for grapheme in display_graphemes(&text[start..end], escape_invisibles) {
+        let width = width_of(&grapheme.display);
+        if chunk_width > 0.0 && chunk_width + width > wrap_width {
+            count += 1;
+            chunk_width = 0.0;
+        }
+        chunk_width += width;
+    }
+    count
+}
+
 /// Display width from the start of the row to `offset`.
 ///
 /// An offset inside a grapheme is treated as the start of that grapheme, so the
@@ -147,6 +174,22 @@ mod tests {
     #[test]
     fn empty_line_is_one_row() {
         assert_eq!(wrap_line("", 0, 0, 10.0, true, &unit_width), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn wrap_count_matches_line_count() {
+        let cases = [
+            ("", 10.0, true),
+            ("abcd", 2.0, false),
+            ("abcd", 10.0, false),
+            ("\u{18}\u{18}\u{18}\u{18}", 5.0, true),
+            ("a\u{18}b", 3.0, true),
+        ];
+        for (text, width, escape) in cases {
+            let rows = wrap_line(text, 0, text.len(), width, escape, &unit_width);
+            let count = wrap_count(text, 0, text.len(), width, escape, &unit_width);
+            assert_eq!(count, rows.len(), "{text:?} at {width}");
+        }
     }
 
     #[test]
