@@ -2,8 +2,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use html_escape::decode_html_entities;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use zapslab_document::encoding::{self as byte_encoding, Encoding};
 
 use super::{Scope, Transform, TransformResult};
+
+/// Registry name of the byte-interpreting decode transform. The view matches on
+/// it to pass the hex pane's current encoding (see [`super::apply_with_encoding`]);
+/// `base64_decode_is_registered` keeps the constant and the registry in sync.
+pub(crate) const BASE64_DECODE_NAME: &str = "Base64 Decode";
 
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
@@ -14,8 +20,8 @@ pub const TRANSFORMS: &[Transform] = &[
         apply: base64_encode,
     },
     Transform {
-        name: "Base64 Decode",
-        description: "Decode standard or URL-safe Base64 to UTF-8 text; whitespace and padding are ignored and invalid input is an error.",
+        name: BASE64_DECODE_NAME,
+        description: "Decode standard or URL-safe Base64 using the hex pane's encoding; whitespace and padding are ignored and invalid input is an error.",
         tags: "base64,btoa,decode",
         scope: Scope::SelectionOrFullText,
         apply: base64_decode,
@@ -124,6 +130,17 @@ fn base64_encode(input: &str) -> TransformResult {
 }
 
 fn base64_decode(input: &str) -> TransformResult {
+    base64_decode_with_encoding(input, Encoding::Utf8)
+}
+
+/// Decodes Base64 and interprets the resulting bytes as text with `encoding`.
+///
+/// The document is Unicode text, so arbitrary bytes can only be represented
+/// losslessly as the Latin-1 code points U+0000..=U+00FF; that is exactly what
+/// `Encoding::Latin1` does. Interpreting the bytes with the hex pane's current
+/// encoding keeps that pane the single "how are these bytes text?" control:
+/// decode binary with Latin-1 selected and the pane shows the original bytes.
+pub(crate) fn base64_decode_with_encoding(input: &str, encoding: Encoding) -> TransformResult {
     // Boop's decoder accepts URL-safe input and ignores whitespace, padding,
     // and any other non-alphabet characters before decoding.
     let mut filtered = String::with_capacity(input.len());
@@ -145,11 +162,12 @@ fn base64_decode(input: &str) -> TransformResult {
     }
 
     match STANDARD.decode(filtered.as_bytes()) {
-        Ok(bytes) => match String::from_utf8(bytes) {
+        Ok(bytes) => match byte_encoding::decode(&bytes, encoding) {
             Ok(text) => TransformResult::replace(text),
-            Err(_) => {
-                TransformResult::error("Base64 Decode: decoded bytes are not valid UTF-8")
-            }
+            Err(_) => TransformResult::error(format!(
+                "Base64 Decode: decoded bytes are not valid {}; set the hex encoding to Latin-1 to decode arbitrary binary",
+                encoding.label()
+            )),
         },
         Err(error) => TransformResult::error(format!("Base64 Decode: {error}")),
     }
@@ -454,6 +472,34 @@ mod tests {
         // "/w==" is the byte 0xFF, which is not valid UTF-8.
         assert!(is_error(base64_decode("/w==")));
         assert_eq!(replaced(base64_decode("")), "");
+    }
+
+    #[test]
+    fn base64_decode_uses_the_given_encoding() {
+        // 0xFF is not valid UTF-8, but it is the Latin-1 code point U+00FF.
+        assert!(is_error(base64_decode_with_encoding("/w==", Encoding::Utf8)));
+        assert_eq!(
+            replaced(base64_decode_with_encoding("/w==", Encoding::Latin1)),
+            "\u{00FF}"
+        );
+
+        // Arbitrary binary round-trips byte-for-byte through Latin-1.
+        let bytes = [0x00, 0x7F, 0x80, 0xFF];
+        let encoded = STANDARD.encode(bytes);
+        let decoded = replaced(base64_decode_with_encoding(&encoded, Encoding::Latin1));
+        assert_eq!(
+            byte_encoding::encode(&decoded, Encoding::Latin1).expect("encode"),
+            bytes.to_vec()
+        );
+    }
+
+    #[test]
+    fn base64_decode_is_registered() {
+        let transform = TRANSFORMS
+            .iter()
+            .find(|transform| transform.name == BASE64_DECODE_NAME)
+            .expect("Base64 Decode must be registered");
+        assert_eq!(transform.name, "Base64 Decode");
     }
 
     #[test]

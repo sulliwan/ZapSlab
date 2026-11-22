@@ -151,6 +151,8 @@ impl Scratchpad {
                             .h(px(line_height))
                             .mr(px(metrics.byte_gap))
                             .flex_shrink_0()
+                            // Double-clicking a byte opens the inline editor.
+                            .cursor_text()
                             .child(format!("{:02x}", cell.byte));
                         if editing {
                             // Draw the byte under edit over the selection so the
@@ -306,6 +308,7 @@ impl Scratchpad {
                     .py(px(2.0))
                     .text_size(px(12.0))
                     .text_color(rgb(0xcdd6f4))
+                    .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event, _window, cx| {

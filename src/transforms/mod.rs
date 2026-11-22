@@ -26,6 +26,8 @@ mod text;
 
 use std::{collections::HashMap, sync::LazyLock};
 
+use zapslab_document::encoding::Encoding;
+
 /// Which text a transform reads and writes back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -109,6 +111,25 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
 /// selection; everything else is always applicable.
 pub fn is_available(transform: &Transform, has_selection: bool) -> bool {
     !(transform.scope == Scope::Selection && !has_selection)
+}
+
+/// Applies a transform that interprets decoded bytes as text, using the hex
+/// pane's current `encoding`. Returns `None` for ordinary transforms, which are
+/// applied with [`Transform::apply`].
+///
+/// Base64 Decode is currently the only byte-interpreting entry: decoding under
+/// the hex pane's encoding is what lets arbitrary binary decode as Latin-1
+/// instead of failing on "not valid UTF-8".
+pub(crate) fn apply_with_encoding(
+    transform: &Transform,
+    input: &str,
+    encoding: Encoding,
+) -> Option<TransformResult> {
+    if transform.name == encoding::BASE64_DECODE_NAME {
+        Some(encoding::base64_decode_with_encoding(input, encoding))
+    } else {
+        None
+    }
 }
 
 /// Transforms that can take noticeably long on a large input (sorts, parsers,
@@ -338,6 +359,21 @@ mod tests {
                 "expensive transform {name:?} is not in the registry"
             );
         }
+    }
+
+    #[test]
+    fn base64_decode_is_encoding_aware() {
+        let find = |name: &str| {
+            TRANSFORMS
+                .iter()
+                .find(|transform| transform.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        // The registered name the view matches on must exist.
+        let base = find(encoding::BASE64_DECODE_NAME);
+        assert!(apply_with_encoding(base, "/w==", Encoding::Latin1).is_some());
+        // Ordinary transforms keep using their plain `apply`.
+        assert!(apply_with_encoding(find("Rot13"), "hello", Encoding::Utf8).is_none());
     }
 
     #[test]
