@@ -398,124 +398,37 @@ impl Scratchpad {
     // input handler instead, so this is only referenced by the native path.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn push_find_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let editing_find = {
+        let insert = field_input(text);
+        let outcome = {
             let Some(state) = &mut self.find else {
                 return;
             };
-            let insert = field_input(text);
             let (start, end) = state.selection();
-            let text_ref = state.active();
-            let start = snap_boundary(text_ref, start);
-            let end = snap_boundary(text_ref, end).max(start);
-            state.active_mut().replace_range(start..end, &insert);
-            let caret = start + insert.len();
-            state.set_caret(caret);
-            state.set_anchor(caret);
-            let editing_find = state.field == FindField::Find;
-            if editing_find {
-                state.reset_history();
-            }
-            editing_find
+            state.replace_active(start, end, &insert)
         };
-        if editing_find {
-            self.after_find_query_changed(cx);
-        } else {
-            cx.notify();
-        }
+        self.apply_field_edit(outcome, cx);
     }
 
     /// Deletes the selection, or the grapheme before the field's caret.
     pub(crate) fn backspace_find(&mut self, cx: &mut Context<Self>) {
-        let (deletion, editing_find) = {
-            let Some(state) = &self.find else {
+        let outcome = {
+            let Some(state) = &mut self.find else {
                 return;
             };
-            let text = state.active();
-            let (sel_start, sel_end) = state.selection();
-            let (start, end) = if sel_start != sel_end {
-                (sel_start, sel_end)
-            } else {
-                let caret = snap_boundary(text, state.caret());
-                if caret == 0 {
-                    (0, 0)
-                } else {
-                    (previous_grapheme_start(text, caret), caret)
-                }
-            };
-            (
-                if start < end {
-                    Some((start, end))
-                } else {
-                    None
-                },
-                state.field == FindField::Find,
-            )
+            state.delete_backward()
         };
-
-        let Some((start, end)) = deletion else {
-            cx.notify();
-            return;
-        };
-        if let Some(state) = &mut self.find {
-            state.active_mut().replace_range(start..end, "");
-            state.set_caret(start);
-            state.set_anchor(start);
-            if editing_find {
-                state.reset_history();
-            }
-        }
-        if editing_find {
-            self.after_find_query_changed(cx);
-        } else {
-            cx.notify();
-        }
+        self.apply_field_edit(outcome, cx);
     }
 
     /// Deletes the selection, or the grapheme after the field's caret.
     pub(crate) fn delete_forward_find(&mut self, cx: &mut Context<Self>) {
-        let (deletion, editing_find) = {
-            let Some(state) = &self.find else {
+        let outcome = {
+            let Some(state) = &mut self.find else {
                 return;
             };
-            let text = state.active();
-            let (sel_start, sel_end) = state.selection();
-            let (start, end) = if sel_start != sel_end {
-                (sel_start, sel_end)
-            } else {
-                let caret = snap_boundary(text, state.caret());
-                if caret >= text.len() {
-                    (0, 0)
-                } else {
-                    (caret, next_grapheme_end(text, caret))
-                }
-            };
-            (
-                if start < end {
-                    Some((start, end))
-                } else {
-                    None
-                },
-                state.field == FindField::Find,
-            )
+            state.delete_forward()
         };
-
-        let Some((start, end)) = deletion else {
-            cx.notify();
-            return;
-        };
-        if let Some(state) = &mut self.find {
-            state.active_mut().replace_range(start..end, "");
-            state.set_caret(start);
-            state.set_anchor(start);
-            if editing_find {
-                state.reset_history();
-            }
-        }
-        if editing_find {
-            self.after_find_query_changed(cx);
-        } else {
-            cx.notify();
-        }
+        self.apply_field_edit(outcome, cx);
     }
 
     /// Moves the active field's caret one grapheme left or right. With `extend`
@@ -792,6 +705,15 @@ impl Scratchpad {
             }
             window.notify_text_input_changed(&self.focus_handle);
             cx.notify();
+        }
+    }
+
+    /// Applies the follow-up for an active-field edit: recompute live matches
+    /// when the Find query changed, otherwise just redraw.
+    pub(crate) fn apply_field_edit(&mut self, outcome: FieldEdit, cx: &mut Context<Self>) {
+        match outcome {
+            FieldEdit::Find => self.after_find_query_changed(cx),
+            FieldEdit::Nothing | FieldEdit::Replace => cx.notify(),
         }
     }
 

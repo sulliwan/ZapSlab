@@ -337,6 +337,74 @@ impl FindState {
         self.history_index = None;
         self.history_draft = None;
     }
+
+    /// Replace the active field's `start..end` with `insert`, clamping both ends
+    /// into the field, snapping to char boundaries, collapsing the selection,
+    /// and parking the caret after the insert. Resets history browsing when the
+    /// Find query changes and reports which field was edited.
+    fn replace_active(&mut self, start: usize, end: usize, insert: &str) -> FieldEdit {
+        let len = self.active().len();
+        let start = snap_boundary(self.active(), start.min(len));
+        let end = snap_boundary(self.active(), end.min(len)).max(start);
+        self.active_mut().replace_range(start..end, insert);
+        let caret = start + insert.len();
+        self.set_caret(caret);
+        self.set_anchor(caret);
+        if self.field == FindField::Find {
+            self.reset_history();
+            FieldEdit::Find
+        } else {
+            FieldEdit::Replace
+        }
+    }
+
+    /// Delete the selection, or the grapheme before the caret.
+    fn delete_backward(&mut self) -> FieldEdit {
+        let (start, end) = {
+            let text = self.active();
+            let (sel_start, sel_end) = self.selection();
+            if sel_start != sel_end {
+                (sel_start, sel_end)
+            } else {
+                let caret = snap_boundary(text, self.caret());
+                if caret == 0 {
+                    return FieldEdit::Nothing;
+                }
+                (previous_grapheme_start(text, caret), caret)
+            }
+        };
+        self.replace_active(start, end, "")
+    }
+
+    /// Delete the selection, or the grapheme after the caret.
+    fn delete_forward(&mut self) -> FieldEdit {
+        let (start, end) = {
+            let text = self.active();
+            let (sel_start, sel_end) = self.selection();
+            if sel_start != sel_end {
+                (sel_start, sel_end)
+            } else {
+                let caret = snap_boundary(text, self.caret());
+                if caret >= text.len() {
+                    return FieldEdit::Nothing;
+                }
+                (caret, next_grapheme_end(text, caret))
+            }
+        };
+        self.replace_active(start, end, "")
+    }
+}
+
+/// Which field an active find/replace field edit touched, so the caller knows
+/// whether live matches must be recomputed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldEdit {
+    /// Nothing changed (e.g. backspace at the start of the field).
+    Nothing,
+    /// The Find query changed.
+    Find,
+    /// Only the Replace field changed.
+    Replace,
 }
 
 /// One row in the transform palette. Commands (which open UI) and transforms
@@ -1903,35 +1971,24 @@ impl EntityInputHandler for Scratchpad {
         }
         // Route typing/paste to the active find/replace field when it is open.
         if self.find.is_some() {
-            let editing_find = {
+            let insert = field_input(text);
+            let outcome = {
                 let Some(state) = &mut self.find else {
                     return;
                 };
-                let field_text = state.active();
                 let (start, end) = match replacement_range {
-                    Some(range) => (
-                        byte_offset_for_utf16(field_text, range.start),
-                        byte_offset_for_utf16(field_text, range.end),
-                    ),
+                    Some(range) => {
+                        let field_text = state.active();
+                        (
+                            byte_offset_for_utf16(field_text, range.start),
+                            byte_offset_for_utf16(field_text, range.end),
+                        )
+                    }
                     None => state.selection(),
                 };
-                let len = field_text.len();
-                let start = start.min(len);
-                let end = end.min(len).max(start);
-                let insert = field_input(text);
-                state.active_mut().replace_range(start..end, &insert);
-                let caret = start + insert.len();
-                state.set_caret(caret);
-                state.set_anchor(caret);
-                let editing_find = state.field == FindField::Find;
-                if editing_find {
-                    state.reset_history();
-                }
-                editing_find
+                state.replace_active(start, end, &insert)
             };
-            if editing_find {
-                self.after_find_query_changed(cx);
-            }
+            self.apply_field_edit(outcome, cx);
             window.notify_text_input_changed(&self.focus_handle);
             cx.notify();
             return;

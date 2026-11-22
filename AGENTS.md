@@ -281,9 +281,11 @@ keep the public signatures identical across both.
 - **Refuse over-limit input before mutating.** Check `MAX_DOCUMENT_BYTES` in the
   view and again in the model. An oversized paste gets the dedicated message;
   other overflows get the generic limit message.
-- **Keep the expensive-transform list current.** `transforms::is_expensive` is a
-  name list; add any new sort/parser/formatter/shuffle so the confirmation modal
-  covers it.
+- **Keep the expensive-transform list current.** `transforms::is_expensive`
+  checks `EXPENSIVE_TRANSFORMS`, a name list; add any new
+  sort/parser/formatter/shuffle so the confirmation modal covers it. Its
+  `expensive_names_are_registered` test fails if a listed name is renamed, so
+  the list cannot silently go stale.
 - **Use `#[cfg(target_arch = "wasm32")]` with a non-wasm stub** for platform
   code and keep public signatures uniform, so callers compile on both targets.
 - **UTF-16 is the platform boundary.** `EntityInputHandler` speaks UTF-16; the

@@ -30,32 +30,28 @@ impl Scratchpad {
         }
 
         let query = query.trim().to_lowercase();
-        let recency = transforms::recency_ranks(&self.recent_transforms);
+        // Enumerate transforms then commands so equal-score ties keep the
+        // palette's transform-first order. `rank_matches` owns the shared
+        // scoring and recency rules.
+        let mut entries: Vec<PaletteEntry> = (0..transforms::TRANSFORMS.len())
+            .map(PaletteEntry::Transform)
+            .collect();
+        entries.extend((0..commands::COMMANDS.len()).map(PaletteEntry::Command));
 
-        let mut scored: Vec<(u32, usize, usize, PaletteEntry)> = Vec::new();
-        for (index, transform) in transforms::TRANSFORMS.iter().enumerate() {
-            if let Some(score) = transforms::match_score_parts(
-                transform.name,
-                transform.tags,
-                transform.description,
-                &query,
-            ) {
-                let rank = recency.get(transform.name).copied().unwrap_or(usize::MAX);
-                scored.push((score, rank, index, PaletteEntry::Transform(index)));
-            }
-        }
-        for (index, command) in commands::COMMANDS.iter().enumerate() {
-            if let Some(score) = transforms::match_score_parts(
-                command.name,
-                command.tags,
-                command.description,
-                &query,
-            ) {
-                scored.push((score, usize::MAX, index, PaletteEntry::Command(index)));
-            }
-        }
-        scored.sort_by(|a, b| transforms::compare_ranked(&(a.0, a.1, a.2), &(b.0, b.1, b.2)));
-        scored.into_iter().map(|(_, _, _, entry)| entry).collect()
+        let ranked =
+            transforms::rank_matches(&query, &self.recent_transforms, &entries, |_, entry| {
+                match *entry {
+                    PaletteEntry::Transform(index) => {
+                        let transform = &transforms::TRANSFORMS[index];
+                        (transform.name, transform.tags, transform.description, index)
+                    }
+                    PaletteEntry::Command(index) => {
+                        let command = &commands::COMMANDS[index];
+                        (command.name, command.tags, command.description, index)
+                    }
+                }
+            });
+        ranked.into_iter().map(|index| entries[index]).collect()
     }
 
     pub(crate) fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {

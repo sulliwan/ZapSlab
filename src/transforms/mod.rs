@@ -111,36 +111,40 @@ pub fn is_available(transform: &Transform, has_selection: bool) -> bool {
     !(transform.scope == Scope::Selection && !has_selection)
 }
 
-/// Whether a transform can take noticeably long on a large input (sorts,
-/// parsers, formatters, shuffles). The view confirms before running one of
-/// these against a big range so the UI does not appear to hang.
+/// Transforms that can take noticeably long on a large input (sorts, parsers,
+/// formatters, shuffles).
 ///
-/// This is intentionally a name list rather than a per-entry field so adding a
-/// transform does not require touching every other entry; keep it in sync when
-/// adding a heavy one.
+/// Kept as a name list rather than a per-entry field so adding an ordinary
+/// transform does not require touching every other entry. The
+/// `expensive_names_are_registered` test fails if one of these names is renamed
+/// or removed, so the list cannot silently go stale.
+const EXPENSIVE_TRANSFORMS: &[&str] = &[
+    "Sort lines",
+    "Natural Sort Lines",
+    "Shuffle Lines",
+    "Remove Duplicate Lines",
+    "Format JSON",
+    "Minify JSON",
+    "Sort JSON",
+    "JSON to CSV",
+    "CSV to JSON",
+    "JSON to YAML",
+    "YAML to JSON",
+    "JSON to Query String",
+    "Query String to JSON",
+    "JWT Decode",
+    "Format XML",
+    "Minify XML",
+    "Format SQL",
+    "Minify SQL",
+    "Eval Javascript",
+];
+
+/// Whether a transform can take noticeably long on a large input. The view
+/// confirms before running one of these against a big range so the UI does not
+/// appear to hang.
 pub fn is_expensive(transform: &Transform) -> bool {
-    matches!(
-        transform.name,
-        "Sort lines"
-            | "Natural Sort Lines"
-            | "Shuffle Lines"
-            | "Remove Duplicate Lines"
-            | "Format JSON"
-            | "Minify JSON"
-            | "Sort JSON"
-            | "JSON to CSV"
-            | "CSV to JSON"
-            | "JSON to YAML"
-            | "YAML to JSON"
-            | "JSON to Query String"
-            | "Query String to JSON"
-            | "JWT Decode"
-            | "Format XML"
-            | "Minify XML"
-            | "Format SQL"
-            | "Minify SQL"
-            | "Eval Javascript"
-    )
+    EXPENSIVE_TRANSFORMS.contains(&transform.name)
 }
 
 /// Relevance of a palette entry (a transform or a command) for a lowercased
@@ -172,12 +176,6 @@ pub(crate) fn match_score_parts(
     } else {
         None
     }
-}
-
-/// Relevance of `transform` for a lowercased `query`, or `None` if it does not
-/// match. Name matches always outrank tag/description matches.
-fn match_score(transform: &Transform, query: &str) -> Option<u32> {
-    match_score_parts(transform.name, transform.tags, transform.description, query)
 }
 
 /// Palette ordering for `query`: best match first.
@@ -212,26 +210,45 @@ pub fn search(query: &str, recent: &[String]) -> Vec<usize> {
         return ordered;
     }
 
-    // Name -> recency position (0 = newest); duplicate names keep the first.
-    let recency = recency_ranks(recent);
+    rank_matches(&query, recent, &TRANSFORMS[..], |index, transform| {
+        (transform.name, transform.tags, transform.description, index)
+    })
+}
 
-    let mut scored: Vec<(u32, usize, usize)> = TRANSFORMS
+/// Scores `entries` against a lowercased `query` and returns the positions of
+/// the matches ordered best-first: higher score, then lower recency rank, then
+/// the caller's `order` tiebreak.
+///
+/// `describe` returns `(name, tags, description, order)` for an entry. Both the
+/// transform-only [`search`] and the view's combined transform+command palette
+/// use this, so their ranking rules cannot drift.
+pub(crate) fn rank_matches<T>(
+    query: &str,
+    recent: &[String],
+    entries: &[T],
+    describe: impl Fn(usize, &T) -> (&'static str, &'static str, &'static str, usize),
+) -> Vec<usize> {
+    let recency = recency_ranks(recent);
+    let mut scored: Vec<(u32, usize, usize, usize)> = entries
         .iter()
         .enumerate()
-        .filter_map(|(index, transform)| {
-            let score = match_score(transform, &query)?;
-            let recent_rank = recency.get(transform.name).copied().unwrap_or(usize::MAX);
-            Some((score, recent_rank, index))
+        .filter_map(|(position, entry)| {
+            let (name, tags, description, order) = describe(position, entry);
+            let score = match_score_parts(name, tags, description, query)?;
+            let recent_rank = recency.get(name).copied().unwrap_or(usize::MAX);
+            Some((score, recent_rank, order, position))
         })
         .collect();
-    scored.sort_by(compare_ranked);
-    scored.into_iter().map(|(_, _, index)| index).collect()
+    scored.sort_by(|a, b| compare_ranked(&(a.0, a.1, a.2), &(b.0, b.1, b.2)));
+    scored
+        .into_iter()
+        .map(|(_, _, _, position)| position)
+        .collect()
 }
 
 /// Recency rank per transform name (0 = newest); duplicate names keep the
-/// first occurrence. Shared by [`search`] and the view's combined palette
-/// ranking so both apply recency identically.
-pub(crate) fn recency_ranks(recent: &[String]) -> HashMap<&str, usize> {
+/// first occurrence.
+fn recency_ranks(recent: &[String]) -> HashMap<&str, usize> {
     let mut recency = HashMap::new();
     for (position, name) in recent.iter().enumerate() {
         recency.entry(name.as_str()).or_insert(position);
@@ -241,10 +258,7 @@ pub(crate) fn recency_ranks(recent: &[String]) -> HashMap<&str, usize> {
 
 /// Ordering for palette candidates: higher score first, then lower recency
 /// rank, then declaration order.
-pub(crate) fn compare_ranked(
-    a: &(u32, usize, usize),
-    b: &(u32, usize, usize),
-) -> std::cmp::Ordering {
+fn compare_ranked(a: &(u32, usize, usize), b: &(u32, usize, usize)) -> std::cmp::Ordering {
     b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
@@ -314,6 +328,16 @@ mod tests {
         assert!(!is_expensive(find("Rot13")));
         assert!(!is_expensive(find("MD5 Checksum")));
         assert!(!is_expensive(find("Count Characters")));
+    }
+
+    #[test]
+    fn expensive_names_are_registered() {
+        for name in EXPENSIVE_TRANSFORMS {
+            assert!(
+                TRANSFORMS.iter().any(|transform| transform.name == *name),
+                "expensive transform {name:?} is not in the registry"
+            );
+        }
     }
 
     #[test]
