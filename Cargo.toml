@@ -1,5 +1,5 @@
 [package]
-name = "boopweb"
+name = "zapslab"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -12,7 +12,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecf
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
 gpui_web = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
 base64 = "0.22"
-boopweb-document = { path = "crates/document" }
+zapslab-document = { path = "crates/document" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Keep this in lockstep with the wasm-bindgen crate that the pinned zed rev

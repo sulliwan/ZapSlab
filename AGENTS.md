@@ -1,12 +1,12 @@
 # AGENTS.md
 
-Guidance for contributors and coding agents working on **boopweb**. Read this
+Guidance for contributors and coding agents working on **Zapslab**. Read this
 before changing code; it captures the conventions the project follows,
 including the split between the pure document model and the gpui view.
 
 ## What this is
 
-Boopweb is a WASM/GPUI scratchpad editor, similar in spirit to Boop, shipped as
+Zapslab is a WASM/GPUI scratchpad editor, similar in spirit to Boop, shipped as
 an installable PWA. A single window hosts a plain-text editor with soft wrap,
 selection, undo/redo, a transform palette, and localStorage autosave. It is a
 small codebase with a deliberately thin, pure core and a gpui rendering shell.
@@ -14,12 +14,12 @@ small codebase with a deliberately thin, pure core and a gpui rendering shell.
 ## Repository layout
 
 ```
-src/                 root crate `boopweb` (gpui view + platform glue)
+src/                 root crate `zapslab` (gpui view + platform glue)
   main.rs            bootstrap, window creation, embedded fonts
   app.rs             Scratchpad: rendering, geometry, input, palette, scrollbar
   storage.rs         localStorage autosave (wasm-only + non-wasm stub)
   transforms.rs      pure transform registry (name + fn(&str) -> String)
-crates/document/     standalone crate `boopweb-document` (pure model + tests)
+crates/document/     standalone crate `zapslab-document` (pure model + tests)
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
 docker/Dockerfile    pinned builder image (Rust + wasm32 + wasm-bindgen + binaryen)
@@ -28,7 +28,7 @@ dist/                generated web output (gitignored)
 .cache/              cargo/home caches and patched wgpu (gitignored)
 ```
 
-The pure document model lives in `crates/document` (package `boopweb-document`).
+The pure document model lives in `crates/document` (package `zapslab-document`).
 Treat that crate as the home for all non-gpui logic described below; the gpui
 `Scratchpad` view delegates text, cursor, line-index, and undo work to it.
 
@@ -80,7 +80,7 @@ flowchart TD
     app --> transforms["src/transforms.rs<br/>pure registry"]
 ```
 
-### `boopweb-document` — pure model
+### `zapslab-document` — pure model
 
 Owns everything that is text, offsets, or history:
 
@@ -102,7 +102,7 @@ Rules:
 - If a helper needs a glyph advance or a viewport width, it is *not* pure model
   logic; keep the measurement in the view and pass bytes/offsets across.
 
-### `boopweb` — gpui view
+### `zapslab` — gpui view
 
 `Scratchpad` in `src/app.rs` stays responsible for:
 
@@ -123,7 +123,7 @@ startup failures (fonts/window); avoid panics on the input hot path.
 `#[cfg(target_arch = "wasm32")]` with a no-op non-wasm stub so native builds and
 tests still compile; keep the public signatures identical across both.
 
-- Keys are versioned (`boopweb.text.v1`): an old version is ignored and
+- Keys are versioned (`zapslab.text.v1`): an old version is ignored and
   overwritten, not migrated.
 - `save` is **fallible** and callers must surface failures (e.g. a status-bar
   message). Do not silently discard a failed save.
@@ -134,7 +134,7 @@ tests still compile; keep the public signatures identical across both.
 
 - **Keep logic pure and unit-testable.** Extract pure helpers instead of burying
   them in the view. If it can be a function over `(&str, offsets)`, it belongs in
-  `boopweb-document`.
+  `zapslab-document`.
 - **Name constants instead of using magic numbers.** Follow the existing
   `FONT_SIZE`, `PAD`, `CARET_WIDTH`, `MAX_UNDO`, `STATUS_BAR_HEIGHT`,
   `SCROLLBAR_*`, `MIN_THUMB_WIDTH` style.
@@ -146,7 +146,7 @@ tests still compile; keep the public signatures identical across both.
   user. `let _ = op()` is only acceptable where failure is genuinely irrelevant
   (and should be commented).
 - **Bound history with a ring buffer.** Undo/redo stay O(1) at the ends via
-  `VecDeque` (`push_back`/`pop_front`) in `boopweb-document`, enforcing
+  `VecDeque` (`push_back`/`pop_front`) in `zapslab-document`, enforcing
   `MAX_UNDO`. Do not reintroduce `Vec::remove(0)` on the hot path. Preserve the
   behavior of not pushing duplicate snapshots, and keep contiguous typing runs
   coalesced into a single undo step.

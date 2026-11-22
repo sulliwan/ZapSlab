@@ -1,6 +1,6 @@
 {
-  "name": "boopweb",
-  "short_name": "boopweb",
+  "name": "Zapslab",
+  "short_name": "Zapslab",
   "description": "A self-contained scratchpad running on WebAssembly.",
   "start_url": "/",
   "scope": "/",

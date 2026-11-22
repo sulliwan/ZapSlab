@@ -1,4 +1,4 @@
-//! Pure document model for boopweb.
+//! Pure document model for Zapslab.
 //!
 //! Everything here is plain `std`: text, the byte-offset cursor/anchor, the
 //! line-start index, the bounded undo/redo history, and the UTF-16 ⇄ byte

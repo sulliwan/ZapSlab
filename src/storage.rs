@@ -7,7 +7,7 @@
 mod imp {
     use web_sys::{window, Storage};
 
-    const KEY: &str = "boopweb.text.v1";
+    const KEY: &str = "zapslab.text.v1";
 
     fn storage() -> Option<Storage> {
         window()?.local_storage().ok().flatten()

@@ -14,7 +14,7 @@
 
 use std::{cell::Cell, ops::Range, rc::Rc, time::Duration};
 
-use boopweb_document::{
+use zapslab_document::{
     Document, byte_offset_for_utf16, display,
     encoding::{self, Encoding},
     hexdump::HexLayout,
@@ -1449,7 +1449,7 @@ impl Scratchpad {
             .child(header)
             .child(
                 div()
-                    .id("boopweb-hex-scroll")
+                    .id("zapslab-hex-scroll")
                     .flex_1()
                     .min_h(px(0.0))
                     .relative()
@@ -1469,7 +1469,7 @@ impl Scratchpad {
     }
 }
 
-// ---- UTF-16 helpers live in the `boopweb-document` crate ---------------
+// ---- UTF-16 helpers live in the `zapslab-document` crate ---------------
 
 impl EntityInputHandler for Scratchpad {
     fn text_for_range(
@@ -1825,7 +1825,7 @@ impl Render for Scratchpad {
         .size_full();
 
         let scroll = div()
-            .id("boopweb-scroll")
+            .id("zapslab-scroll")
             .absolute()
             .top_0()
             .left_0()

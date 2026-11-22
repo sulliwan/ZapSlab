@@ -1,4 +1,4 @@
-# Builder image for boopweb.
+# Builder image for Zapslab.
 #
 # Pinned Rust stable + wasm32 target + wasm-bindgen CLI (must match the
 # wasm-bindgen pin in Cargo.toml) + binaryen for wasm-opt.

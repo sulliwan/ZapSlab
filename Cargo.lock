@@ -506,28 +506,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boopweb"
-version = "0.1.0"
-dependencies = [
- "base64",
- "boopweb-document",
- "console_error_panic_hook",
- "gpui",
- "gpui_platform",
- "gpui_web",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "boopweb-document"
-version = "0.1.0"
-dependencies = [
- "unicode-properties",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5330,6 +5308,28 @@ dependencies = [
  "quote",
  "syn 3.0.10",
  "synstructure",
+]
+
+[[package]]
+name = "zapslab"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "console_error_panic_hook",
+ "gpui",
+ "gpui_platform",
+ "gpui_web",
+ "wasm-bindgen",
+ "web-sys",
+ "zapslab-document",
+]
+
+[[package]]
+name = "zapslab-document"
+version = "0.1.0"
+dependencies = [
+ "unicode-properties",
+ "unicode-segmentation",
 ]
 
 [[package]]

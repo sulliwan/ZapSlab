@@ -1,10 +1,10 @@
-# boopweb — containerized builds.
+# Zapslab — containerized builds.
 #
 # Every cargo/rust invocation runs inside a pinned builder image, so the host
 # only needs a container runtime (nerdctl / docker / podman) and make.
 
 RUNTIME ?= $(shell command -v nerdctl >/dev/null 2>&1 && echo nerdctl || (command -v docker >/dev/null 2>&1 && echo docker || echo podman))
-IMAGE ?= boopweb-builder
+IMAGE ?= zapslab-builder
 # Default to the Rust devcontainer image already present on this machine
 # (rustc 1.99.1). For fully reproducible builds elsewhere, use:
 #   make image RUST_IMAGE=rust:1.98.1-bookworm
@@ -33,7 +33,7 @@ RUN = $(RUNTIME) run --rm \
 .PHONY: help image check test wasm web icons serve shell vendor-wgpu clean
 
 help:
-	@echo "boopweb targets:"
+	@echo "Zapslab targets:"
 	@echo "  image  build the builder image ($(IMAGE) from $(RUST_IMAGE))"
 	@echo "  check  cargo check for wasm32-unknown-unknown (fast feedback)"
 	@echo "  test   unit tests for the pure document model (no wasm/gpui deps)"

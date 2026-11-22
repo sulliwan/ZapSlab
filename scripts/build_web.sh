@@ -6,7 +6,7 @@ cargo build --profile web --target wasm32-unknown-unknown
 
 rm -rf dist
 wasm-bindgen --target web --out-dir dist \
-	target/wasm32-unknown-unknown/web/boopweb.wasm
+	target/wasm32-unknown-unknown/web/zapslab.wasm
 
 if command -v wasm-opt >/dev/null 2>&1; then
 	# Rust emits bulk-memory / trunc_sat; older binaryen needs them enabled.
@@ -15,7 +15,7 @@ if command -v wasm-opt >/dev/null 2>&1; then
 		--enable-nontrapping-float-to-int \
 		--enable-sign-ext \
 		--enable-mutable-globals \
-		dist/boopweb_bg.wasm -o dist/boopweb_bg.wasm
+		dist/zapslab_bg.wasm -o dist/zapslab_bg.wasm
 fi
 
 cp web/index.html web/manifest.webmanifest web/sw.js web/_headers dist/
@@ -25,6 +25,6 @@ cp -R web/icons/. dist/icons/
 
 echo
 echo "wasm binary:"
-ls -lh dist/boopweb_bg.wasm
+ls -lh dist/zapslab_bg.wasm
 echo
 echo "dist/ is ready to deploy (Cloudflare Pages: output directory = dist)"

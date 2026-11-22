@@ -1,14 +1,14 @@
-// boopweb service worker: offline app shell.
-// App code (boopweb.js / boopweb_bg.wasm) is served network-first, so a deploy
+// Zapslab service worker: offline app shell.
+// App code (zapslab.js / zapslab_bg.wasm) is served network-first, so a deploy
 // is picked up even without a VERSION bump; bumping VERSION still purges the
 // old cache of the remaining assets on activate.
 
-const VERSION = "boopweb-v10";
+const VERSION = "zapslab-v1";
 const SHELL = [
   "/",
   "/index.html",
-  "/boopweb.js",
-  "/boopweb_bg.wasm",
+  "/zapslab.js",
+  "/zapslab_bg.wasm",
   "/manifest.webmanifest",
   "/icons/icon-192.png",
   "/icons/icon-512.png",
