@@ -61,7 +61,7 @@ const TRANSFORM_CONFIRM_BYTES: usize = 2 * 1024 * 1024;
 /// Keep the recently-used list short enough to scan at a glance.
 const RECENT_TRANSFORMS_MAX: usize = 8;
 /// How long a transient status-bar hint stays visible.
-const HINT_DURATION: Duration = Duration::from_millis(1800);
+const HINT_DURATION: Duration = Duration::from_millis(3600);
 /// Default hex panel width as a fraction of the viewport.
 const HEX_PANEL_DEFAULT_RATIO: f32 = 0.40;
 /// Lower/upper bounds the hex panel is clamped to while resizing.
@@ -1136,10 +1136,14 @@ impl Scratchpad {
                 "a" => self.select_all(cx),
                 "c" => self.copy(cx),
                 "x" => self.cut(window, cx),
-                // Cmd/Ctrl+Shift+Space opens the transform palette. The usual
-                // editor convention, Cmd/Ctrl+Shift+P, is reserved by Firefox
-                // for "New Private Window" and cannot be cancelled by page
-                // content, so it can't be used in a browser tab.
+                // Cmd/Ctrl+K opens the transform palette. Cmd/Ctrl+Shift+P is
+                // the usual editor convention but Firefox reserves it for
+                // "New Private Window", so it can't be used in a browser tab.
+                // Chrome gives Cmd/Ctrl+K to its address bar in a tab, but the
+                // standalone PWA has none; when we handle the key, `on_key_down`
+                // stops propagation, which makes gpui call `preventDefault`.
+                // Ctrl+Shift+Space is kept as a fallback where K is taken.
+                "k" => self.open_palette(window, cx),
                 "space" if modifiers.shift => self.open_palette(window, cx),
                 "z" if modifiers.shift => self.redo(window, cx),
                 "z" => self.undo(window, cx),
@@ -1188,7 +1192,8 @@ impl Scratchpad {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
 
-        if (modifiers.platform || modifiers.control) && modifiers.shift && keystroke.key == "space"
+        if (modifiers.platform || modifiers.control)
+            && (keystroke.key == "k" || (modifiers.shift && keystroke.key == "space"))
         {
             self.palette = None;
             window.notify_text_input_changed(&self.focus_handle);
@@ -2656,6 +2661,7 @@ impl Render for Scratchpad {
                 Some(cx.on_blur(&self.focus_handle, window, |this, _window, cx| {
                     this.flush_save(cx)
                 }));
+            self.show_hint("Press ctrl+k to see the magic", cx);
         }
 
         // gpui rounds each authored row height to the device-pixel grid during
@@ -3140,10 +3146,18 @@ impl Render for Scratchpad {
                 .flex_col()
                 .items_center()
                 .pt(px(80.0))
+                // Stop the hit test at the modal so the editor's scroll
+                // container behind it no longer receives wheel events (gpui's
+                // scroll hit-testing considers every hitbox under the pointer).
+                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|_this, _event, _window, cx| {
+                    cx.listener(|this, _event, window, cx| {
+                        // Clicking the dimmed backdrop cancels, like Esc.
+                        this.palette = None;
+                        window.notify_text_input_changed(&this.focus_handle);
                         cx.stop_propagation();
+                        cx.notify();
                     }),
                 )
                 .child(
@@ -3154,6 +3168,14 @@ impl Render for Scratchpad {
                         .text_size(px(14.0))
                         .flex()
                         .flex_col()
+                        // Keep clicks on the dialog from bubbling to the
+                        // backdrop's cancel handler.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
                         .child(
                             div()
                                 .px(px(8.0))

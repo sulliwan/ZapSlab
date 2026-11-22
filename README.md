@@ -8,7 +8,7 @@ It's a scratchpad similar to [Boop](https://github.com/IvanMathy/Boop), but runn
 
 Currently there is no public demo site or official builds yet. But basically just `make web` and host the files in `dist` somewhere.
 
-The actual app itself is very simple - you have a text buffer, a few toggles in statusbar and you hit `ctrl+shift+space` to access the command palette. The commands will apply to selection or the whole contents if nothing is selected.
+The actual app itself is very simple - you have a text buffer, a few toggles in statusbar and you hit `ctrl+k` (or `ctrl+shift+space`) to access the command palette. The commands will apply to selection or the whole contents if nothing is selected.
 
 You can install it as a PWA.
 
