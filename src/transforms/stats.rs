@@ -24,18 +24,25 @@ pub const TRANSFORMS: &[Transform] = &[
     },
 ];
 
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 fn count_characters(input: &str) -> TransformResult {
     // Mirrors JS string length: UTF-16 code units, so astral characters count 2.
-    TransformResult::report(format!("{} characters", input.encode_utf16().count()))
+    let n = input.encode_utf16().count();
+    TransformResult::report(format!("{n} character{}", plural(n)))
 }
 
 fn count_lines(input: &str) -> TransformResult {
     // JS `split('\n').length` is one more than the number of newlines.
-    TransformResult::report(format!("{} lines", input.split('\n').count()))
+    let n = input.split('\n').count();
+    TransformResult::report(format!("{n} line{}", plural(n)))
 }
 
 fn count_words(input: &str) -> TransformResult {
-    TransformResult::report(format!("{} words", input.split_whitespace().count()))
+    let n = input.split_whitespace().count();
+    TransformResult::report(format!("{n} word{}", plural(n)))
 }
 
 #[cfg(test)]
@@ -46,8 +53,7 @@ mod tests {
         match result {
             TransformResult::Report(message) => message,
             TransformResult::Error(message) => message,
-            TransformResult::Replace(_)
-            | TransformResult::ReplaceAndReport { .. } => {
+            TransformResult::Replace(_) | TransformResult::ReplaceAndReport { .. } => {
                 panic!("expected a report, got a replacement")
             }
         }
@@ -64,7 +70,7 @@ mod tests {
     fn counts_lines_including_trailing_newline() {
         assert_eq!(message(count_lines("a\nb")), "2 lines");
         assert_eq!(message(count_lines("a\n")), "2 lines");
-        assert_eq!(message(count_lines("")), "1 lines");
+        assert_eq!(message(count_lines("")), "1 line");
     }
 
     #[test]

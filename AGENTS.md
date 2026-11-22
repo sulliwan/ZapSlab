@@ -20,8 +20,9 @@ gpui rendering shell.
 ```
 src/                 root crate `zapslab` (gpui view + platform glue)
   main.rs            bootstrap, window creation, embedded fonts
-  app.rs             Scratchpad: rendering, geometry, input, palette,
-                     find/replace dialog, scrollbars
+  app.rs             Scratchpad: state, geometry, editing, input, Render layout
+  app/view/          cohesive `impl Scratchpad` groups (find, hex, mouse,
+                     palette, paint, scroll) + shared scrollbar geometry
   commands.rs        palette commands that open UI (find / find-replace)
   find.rs            pure find/replace engine (regex + literal, capture expansion,
                      one-step replace-all)
@@ -169,7 +170,8 @@ Rules:
 
 ### `zapslab` — gpui view
 
-`Scratchpad` in `src/app.rs` stays responsible for:
+`Scratchpad` (defined in `src/app.rs`, with cohesive method groups split into
+`src/app/view/`) stays responsible for:
 
 - **virtualized rendering**: only rows in (and just around) the viewport are
   materialized, positioned by top/bottom spacers inside a content element with an
@@ -362,11 +364,12 @@ keep the public signatures identical across both.
   buffer (an explicit, user-initiated transformation).
 - **Wrap-on layout rebuild is O(lines log n)** and only runs for documents below
   the auto-disable thresholds; large buffers use wrap-off with O(1) row mapping.
-- **Regex "find prev" is O(matches).** Backward search has no native regex API,
-  so it scans forward up to the cursor; literal backward search is
-  `str::rfind`-fast. The dialog shows No matches / Wrapped instead of a live
-  total count, which would rescan on every keystroke. Regex and replace-all
-  whole-buffer cost is accepted as user-initiated work.
+- **Regex and case-insensitive "find prev" are O(matches).** Backward search
+  has no native reverse regex API, so those scan forward up to the cursor;
+  case-sensitive literal backward search uses `str::rfind`. The dialog shows
+  No matches / Wrapped instead of a live total count, which would rescan on
+  every keystroke. Regex and replace-all whole-buffer cost is accepted as
+  user-initiated work.
 - **Browser `Ctrl+F` may not be interceptable.** In some browsers a normal tab
   reserves `Ctrl/Cmd+F`, so `preventDefault` may not suppress native find even
   though the key is handled. Verify in the installed PWA; `Ctrl/Cmd+Shift+F` and

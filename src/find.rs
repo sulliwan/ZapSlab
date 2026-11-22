@@ -11,6 +11,9 @@
 //! of two sets of boundary rules. It also means metacharacters a user types in
 //! a literal query (`1+1`, `(x)`) are matched verbatim after escaping.
 //!
+//! Case-sensitive literal backward search uses `str::rfind`; case-insensitive
+//! literals and regexes scan matches (there is no native reverse regex API).
+//!
 //! Zero-width matches are skipped in navigation and replacement. A pattern such
 //! as `a*` matches the empty string at every position; returning those would
 //! make "find next" never advance and "replace all" insert between every
@@ -32,6 +35,10 @@ use regex::{Regex, RegexBuilder};
 pub struct Matcher {
     regex: Regex,
     expand: bool,
+    /// Raw query for case-sensitive literal searches, enabling `str::find` /
+    /// `str::rfind` fast paths. `None` for regex queries and case-insensitive
+    /// literals, which need the regex engine's Unicode case folding.
+    literal: Option<String>,
 }
 
 /// Compiles a query.
@@ -62,6 +69,7 @@ pub fn compile(
     Ok(Some(Matcher {
         regex,
         expand: is_regex,
+        literal: (!is_regex && !case_insensitive).then(|| query.to_string()),
     }))
 }
 
@@ -74,6 +82,12 @@ pub fn find_next(text: &str, matcher: &Matcher, from: usize) -> Option<(usize, u
     let mut pos = from.min(text.len());
     while pos > 0 && !text.is_char_boundary(pos) {
         pos -= 1;
+    }
+
+    if let Some(literal) = &matcher.literal {
+        let offset = text[pos..].find(literal.as_str())?;
+        let start = pos + offset;
+        return Some((start, start + literal.len()));
     }
 
     while pos <= text.len() {
@@ -99,11 +113,21 @@ pub fn find_next(text: &str, matcher: &Matcher, from: usize) -> Option<(usize, u
 
 /// Last non-empty match whose end is <= `before`.
 ///
-/// `before` is clamped to the end of the text. It does not need to be a char
-/// boundary because it is only compared against match offsets, never used to
-/// slice.
+/// `before` is clamped to the end of the text and snapped down to a char
+/// boundary. Case-sensitive literal queries use a `str::rfind` fast path;
+/// regex and case-insensitive searches scan forward because there is no
+/// native reverse regex API.
 pub fn find_prev(text: &str, matcher: &Matcher, before: usize) -> Option<(usize, usize)> {
-    let limit = before.min(text.len());
+    let mut limit = before.min(text.len());
+    // Snap down to a char boundary so the literal fast path can slice. Match
+    // offsets are always char boundaries, so `end <= limit` is unchanged.
+    while limit > 0 && !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    if let Some(literal) = &matcher.literal {
+        let offset = text[..limit].rfind(literal.as_str())?;
+        return Some((offset, offset + literal.len()));
+    }
     let mut found = None;
 
     for m in matcher.regex.find_iter(text) {
@@ -169,18 +193,25 @@ pub fn replacement_for(
     out
 }
 
+/// Outcome of [`replace_all`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplaceAll {
+    /// The replacement would push the result past `max_len`.
+    OverLimit,
+    /// No non-empty match exists, so the text is unchanged.
+    Unchanged,
+    /// The fully replaced text.
+    Replaced(String),
+}
+
 /// Replaces every non-empty match in `text`.
 ///
-/// Returns `None` as soon as the growing result exceeds `max_len`, so the
-/// caller can refuse before mutating a document with a hard size cap. When no
-/// non-empty match exists the text is returned unchanged (the caller's cap is
-/// not re-checked in that case).
-pub fn replace_all(
-    text: &str,
-    matcher: &Matcher,
-    template: &str,
-    max_len: usize,
-) -> Option<String> {
+/// Returns [`ReplaceAll::OverLimit`] as soon as the growing result exceeds
+/// `max_len`, so the caller can refuse before mutating a document with a hard
+/// size cap. When no non-empty match exists it returns
+/// [`ReplaceAll::Unchanged`] without copying the input (the caller's cap is not
+/// re-checked in that case).
+pub fn replace_all(text: &str, matcher: &Matcher, template: &str, max_len: usize) -> ReplaceAll {
     let mut out = String::new();
     let mut last = 0;
     let mut replaced = false;
@@ -204,19 +235,19 @@ pub fn replace_all(
         replaced = true;
 
         if out.len() > max_len {
-            return None;
+            return ReplaceAll::OverLimit;
         }
     }
 
     if !replaced {
-        return Some(text.to_string());
+        return ReplaceAll::Unchanged;
     }
 
     out.push_str(&text[last..]);
     if out.len() > max_len {
-        return None;
+        return ReplaceAll::OverLimit;
     }
-    Some(out)
+    ReplaceAll::Replaced(out)
 }
 
 #[cfg(test)]
@@ -284,13 +315,37 @@ mod tests {
     }
 
     #[test]
+    fn case_sensitive_literal_backward_search_matches_existing_semantics() {
+        let m = lit("one");
+        let text = "one two one";
+        assert_eq!(find_prev(text, &m, text.len()), Some((8, 11)));
+        assert_eq!(find_prev(text, &m, 9), Some((0, 3)));
+        assert_eq!(find_prev(text, &m, 8), Some((0, 3)));
+        assert_eq!(find_prev(text, &m, 3), Some((0, 3)));
+        assert_eq!(find_prev(text, &m, 2), None);
+        // A non-boundary `before` must not panic and must snap safely.
+        let accented = "aaaé";
+        let mid = accented.len() - 1; // inside the two-byte é
+        assert_eq!(find_prev(accented, &lit("a"), mid), Some((2, 3)));
+    }
+
+    #[test]
+    fn case_insensitive_literal_still_uses_regex_folding() {
+        let m = compile("é", false, true)
+            .expect("literal compiles")
+            .expect("non-empty");
+        assert_eq!(find_prev("aÉb", &m, "aÉb".len()), Some((1, 3)));
+        assert_eq!(find_next("aÉb", &m, 0), Some((1, 3)));
+    }
+
+    #[test]
     fn literal_not_found() {
         let m = lit("zzz");
         let text = "abc";
 
         assert_eq!(find_next(text, &m, 0), None);
         assert_eq!(find_prev(text, &m, text.len()), None);
-        assert_eq!(replace_all(text, &m, "X", 0), Some("abc".to_string()));
+        assert_eq!(replace_all(text, &m, "X", 0), ReplaceAll::Unchanged);
     }
 
     #[test]
@@ -368,7 +423,10 @@ mod tests {
         );
         // The range is ignored entirely in literal mode.
         assert_eq!(replacement_for(text, &m, (999, 1000), "$0"), "$0");
-        assert_eq!(replace_all(text, &m, "$0", 100), Some("$0".to_string()));
+        assert_eq!(
+            replace_all(text, &m, "$0", 100),
+            ReplaceAll::Replaced("$0".to_string())
+        );
     }
 
     #[test]
@@ -388,13 +446,13 @@ mod tests {
         let text = "a b a";
         assert_eq!(
             replace_all(text, &lit("a"), "x", 100),
-            Some("x b x".to_string())
+            ReplaceAll::Replaced("x b x".to_string())
         );
 
         let rx = re(r"(\w+)");
         assert_eq!(
             replace_all(text, &rx, "<$1>", 100),
-            Some("<a> <b> <a>".to_string())
+            ReplaceAll::Replaced("<a> <b> <a>".to_string())
         );
     }
 
@@ -405,14 +463,14 @@ mod tests {
 
         assert_eq!(
             replace_all(text, &m, "XYZ", 5),
-            Some("aXYZc".to_string())
+            ReplaceAll::Replaced("aXYZc".to_string())
         );
-        assert_eq!(replace_all(text, &m, "XYZ", 4), None);
+        assert_eq!(replace_all(text, &m, "XYZ", 4), ReplaceAll::OverLimit);
 
         // No matches: unchanged, even when the input itself is over the cap.
         assert_eq!(
             replace_all(text, &lit("z"), "XYZ", 0),
-            Some("abc".to_string())
+            ReplaceAll::Unchanged
         );
     }
 
@@ -422,17 +480,14 @@ mod tests {
         let text = "bbb";
         assert_eq!(find_next(text, &m, 0), None);
         assert_eq!(find_prev(text, &m, text.len()), None);
-        assert_eq!(
-            replace_all(text, &m, "X", 100),
-            Some("bbb".to_string())
-        );
+        assert_eq!(replace_all(text, &m, "X", 100), ReplaceAll::Unchanged);
 
         let mixed = "ba";
         assert_eq!(find_next(mixed, &m, 0), Some((1, 2)));
         assert_eq!(find_prev(mixed, &m, mixed.len()), Some((1, 2)));
         assert_eq!(
             replace_all(mixed, &m, "X", 100),
-            Some("bX".to_string())
+            ReplaceAll::Replaced("bX".to_string())
         );
     }
 
@@ -441,10 +496,7 @@ mod tests {
         let m = re("^");
         assert_eq!(find_next("abc", &m, 0), None);
         assert_eq!(find_prev("abc", &m, 3), None);
-        assert_eq!(
-            replace_all("abc", &m, "X", 100),
-            Some("abc".to_string())
-        );
+        assert_eq!(replace_all("abc", &m, "X", 100), ReplaceAll::Unchanged);
     }
 
     #[test]
@@ -478,7 +530,7 @@ mod tests {
 
         assert_eq!(
             replace_all(text, &rx, "!", 100),
-            Some("héllo ! world".to_string())
+            ReplaceAll::Replaced("héllo ! world".to_string())
         );
     }
 }

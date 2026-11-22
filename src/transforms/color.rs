@@ -11,9 +11,11 @@ pub const TRANSFORMS: &[Transform] = &[Transform {
 }];
 
 fn hex_to_rgb(text: &str) -> TransformResult {
-    // `cutHex`: drop a leading `#` and keep at most six characters. Boop then
-    // slices that buffer into three two-character components; short input
-    // yields short (or empty) slices, which `parseInt` turns into `NaN`.
+    // `cutHex`: drop a leading `#`, keeping at most six characters in that
+    // branch. Without a `#` the whole string is collected (only the first six
+    // characters are read by `component`). The buffer is then sliced into
+    // three two-character components; short input yields short (or empty)
+    // slices, which `parseInt` turns into `NaN`.
     let cut: Vec<char> = if text.starts_with('#') {
         text.chars().skip(1).take(6).collect()
     } else {

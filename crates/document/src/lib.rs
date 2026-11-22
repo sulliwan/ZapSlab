@@ -46,8 +46,8 @@ pub const MAX_UNDO_BYTES: usize = 128 * 1024 * 1024;
 /// The buffer itself is always `\n`-only (a hard invariant); the style is kept
 /// as metadata and only materialized at the persistence and clipboard
 /// boundaries. `Mixed` records that the loaded text used more than one style;
-/// it is never a conversion target, and the first explicit conversion (or the
-/// first save, which collapses to `\n`) resolves it.
+/// it is never a conversion target; saving such a document writes LF bytes, and
+/// the metadata stays `Mixed` until an explicit conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineEnding {
     Lf,
@@ -505,6 +505,15 @@ impl Document {
         }
         let single_char = start == end && !inserted.contains('\n') && inserted.chars().count() == 1;
 
+        // Replacing a range with the same bytes is not an edit: leave history
+        // (including redo) untouched and report no change.
+        if &self.text[start..end] == inserted {
+            self.insert_run = None;
+            self.cursor = start + inserted.len();
+            self.anchor = self.cursor;
+            return false;
+        }
+
         let coalesce = single_char
             && self.insert_run.is_some_and(|run| run.end == start)
             && self.cursor == start
@@ -528,13 +537,6 @@ impl Document {
             self.evict_undo();
         } else {
             let removed = self.text[start..end].to_string();
-            if removed == inserted {
-                // Identical replacement: nothing to record or relayout.
-                self.insert_run = None;
-                self.cursor = start + inserted.len();
-                self.anchor = self.cursor;
-                return true;
-            }
             self.push_edit(Edit {
                 start,
                 removed,
@@ -1094,6 +1096,19 @@ mod tests {
         assert!(!document.redo.is_empty());
         assert!(document.insert_text("d"));
         assert!(document.redo.is_empty());
+    }
+
+    #[test]
+    fn identical_replacement_preserves_redo_and_reports_no_change() {
+        let mut document = Document::new("ab".to_string());
+        document.set_cursor(2, false);
+        assert!(document.insert_text("c"));
+        assert!(document.undo());
+        // Replacing `ab` with `ab` changes nothing.
+        assert!(!document.replace_range(0, 2, "ab"));
+        // Redo from before the no-op is still available.
+        assert!(document.redo());
+        assert_eq!(document.text(), "abc");
     }
 
     #[test]

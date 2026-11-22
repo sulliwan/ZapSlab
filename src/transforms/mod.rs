@@ -177,12 +177,7 @@ pub(crate) fn match_score_parts(
 /// Relevance of `transform` for a lowercased `query`, or `None` if it does not
 /// match. Name matches always outrank tag/description matches.
 fn match_score(transform: &Transform, query: &str) -> Option<u32> {
-    match_score_parts(
-        transform.name,
-        transform.tags,
-        transform.description,
-        query,
-    )
+    match_score_parts(transform.name, transform.tags, transform.description, query)
 }
 
 /// Palette ordering for `query`: best match first.
@@ -218,10 +213,7 @@ pub fn search(query: &str, recent: &[String]) -> Vec<usize> {
     }
 
     // Name -> recency position (0 = newest); duplicate names keep the first.
-    let mut recency: HashMap<&str, usize> = HashMap::new();
-    for (position, name) in recent.iter().enumerate() {
-        recency.entry(name.as_str()).or_insert(position);
-    }
+    let recency = recency_ranks(recent);
 
     let mut scored: Vec<(u32, usize, usize)> = TRANSFORMS
         .iter()
@@ -232,8 +224,28 @@ pub fn search(query: &str, recent: &[String]) -> Vec<usize> {
             Some((score, recent_rank, index))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    scored.sort_by(compare_ranked);
     scored.into_iter().map(|(_, _, index)| index).collect()
+}
+
+/// Recency rank per transform name (0 = newest); duplicate names keep the
+/// first occurrence. Shared by [`search`] and the view's combined palette
+/// ranking so both apply recency identically.
+pub(crate) fn recency_ranks(recent: &[String]) -> HashMap<&str, usize> {
+    let mut recency = HashMap::new();
+    for (position, name) in recent.iter().enumerate() {
+        recency.entry(name.as_str()).or_insert(position);
+    }
+    recency
+}
+
+/// Ordering for palette candidates: higher score first, then lower recency
+/// rank, then declaration order.
+pub(crate) fn compare_ranked(
+    a: &(u32, usize, usize),
+    b: &(u32, usize, usize),
+) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
 #[cfg(test)]

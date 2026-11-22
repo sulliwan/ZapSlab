@@ -6,29 +6,16 @@ It's a scratchpad heavily inspired by [Boop](https://github.com/IvanMathy/Boop),
 
 ## How do I use this?
 
-Currently there is no public demo site or official builds yet. But basically just `make web` and host the files in `dist` somewhere.
+Feel free to just use the public site [ZapSlab](https://zabslab.app). To build and host yourself, just `make web` and host the files in `dist` somewhere.
 
-The actual app itself is very simple - you have a text buffer, a few toggles in statusbar and you hit `ctrl+k` (or `ctrl+shift+space`) to access the command palette. The commands will apply to selection or the whole contents if nothing is selected.
+The actual app UI itself is very simple - you have a text buffer, a few toggles in statusbar and you hit `ctrl+k` (or `ctrl+shift+space`) to access the command palette. The commands will apply to selection or the whole contents if nothing is selected. Ctrl+f for find/replace.
 
-You can install it as a PWA.
-
-### Deploying to Cloudflare Pages
-
-`make deploy` builds `dist/` and uploads it with [Wrangler](https://developers.cloudflare.com/workers/wrangler/), all inside a container, so the host only needs `make` and a container runtime.
-
-First create `wrangler.toml` (gitignored) with your Pages project settings:
-
-```toml
-name = "zapslab"
-pages_build_output_dir = "dist"
-# account_id = "..." # optional, when the login sees multiple accounts
-```
-
-Then run `make deploy`. On the first run Wrangler prints a URL and code for an OAuth device-flow login; open the URL on the host, enter the code, and approve. The credentials are stored in `.wrangler/` (gitignored), so later deploys reuse the login. `make deploy-login` runs the login without deploying.
-
-`make deploy` publishes the branch named by `PAGES_BRANCH` (default `main`), which Cloudflare treats as production only when it matches the project's production branch. Any other value creates a preview deployment, e.g. `make deploy PAGES_BRANCH=vibing`.
+You can install it as a PWA and use as a desktop app.
 
 ## FAQ
 
 **Q: Is this vibe-coded?**
-> A: Yes. Nearly all code is written by Deepseek 4.1 Flash. I provided directorial input.
+> A: Yes. Nearly all code is written by Deepseek 4.1 Flash. I provided directorial input and the icon.
+
+**Q: Are mobile devices supported?**
+> A: No, not planned, but maybe?
