@@ -18,7 +18,8 @@ src/                 root crate `zapslab` (gpui view + platform glue)
   main.rs            bootstrap, window creation, embedded fonts
   app.rs             Scratchpad: rendering, geometry, input, palette, scrollbar
   storage.rs         localStorage autosave (wasm-only + non-wasm stub)
-  transforms.rs      pure transform registry (name + fn(&str) -> String)
+  transforms/        pure transform registry (mod.rs + category submodules;
+                     each entry has name/tags/scope + fn(&str) -> TransformResult)
 crates/document/     standalone crate `zapslab-document` (pure model + tests)
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
@@ -77,7 +78,7 @@ flowchart TD
     main["src/main.rs<br/>bootstrap + fonts"] --> app["src/app.rs<br/>Scratchpad (gpui)"]
     app --> doc["crates/document<br/>Document (pure std)"]
     app --> storage["src/storage.rs<br/>localStorage"]
-    app --> transforms["src/transforms.rs<br/>pure registry"]
+    app --> transforms["src/transforms/<br/>pure registry"]
 ```
 
 ### `zapslab-document` — pure model
@@ -184,8 +185,10 @@ tests still compile; keep the public signatures identical across both.
     injectable (a width function) so wrapping math can be tested without gpui.
 - Test behavior, not implementation details. Add a regression test for every bug
   fix in the model.
-- `src/transforms.rs` tests are fine to keep alongside the pure registry; run
+- `src/transforms/` tests are fine to keep alongside the pure registry; run
   them through the containerized target, not host cargo for the root crate.
+  Because the root crate pulls in gpui, the pure transform tests are easiest to
+  run via a small standalone crate that path-includes `src/transforms/mod.rs`.
 
 ## Definition of done
 

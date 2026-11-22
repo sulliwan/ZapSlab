@@ -10,6 +10,21 @@ publish = false
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
 base64 = "0.22"
+# Pure-Rust, wasm-compatible crates backing the transform palette. Keep these
+# out of `zapslab-document` (that crate stays std-only + Unicode helpers).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+csv = "1"
+deunicode = "1"
+html-escape = "0.3"
+md-5 = "0.10"
+percent-encoding = "2"
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha1_smol = "1"
+sha2 = "0.10"
+sqlformat = "0.5"
+unicode-segmentation = "1"
+xmltree = "0.12"
 zapslab-document = { path = "crates/document" }
 
 # The web backend is constructed directly in `main.rs` so it can opt into the

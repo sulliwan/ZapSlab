@@ -166,6 +166,9 @@ pub struct Scratchpad {
     caret_visible: bool,
     word_wrap: bool,
     palette: Option<Palette>,
+    /// Transform index whose description is currently shown (hover on the
+    /// palette's info icon).
+    palette_hover: Option<usize>,
     /// Render non-printing/invisible characters as colored escape sequences.
     /// On by default: the buffer is often inspected as near-binary data.
     show_invisibles: bool,
@@ -235,6 +238,7 @@ impl Scratchpad {
             caret_visible: true,
             word_wrap: true,
             palette: None,
+            palette_hover: None,
             show_invisibles: true,
             hex_panel: false,
             hex_encoding: Encoding::Utf8,
@@ -737,14 +741,11 @@ impl Scratchpad {
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (start, end) = self.document.selection_range();
-        if start == end {
-            // There is nothing to transform; say so instead of silently doing
-            // nothing.
-            self.show_hint("Select text to transform", cx);
-            return;
-        }
+        // Open even with nothing selected: most transforms fall back to the
+        // whole document (Boop's `state.text`), and selection-only entries are
+        // greyed out in the list instead.
         self.palette = Some(Palette::default());
+        self.palette_hover = None;
         self.dragging = false;
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
@@ -773,7 +774,10 @@ impl Scratchpad {
             .iter()
             .enumerate()
             .filter(|(_, transform)| {
-                query.is_empty() || transform.name.to_lowercase().contains(&query)
+                query.is_empty()
+                    || transform.name.to_lowercase().contains(&query)
+                    || transform.tags.to_lowercase().contains(&query)
+                    || transform.description.to_lowercase().contains(&query)
             })
             .map(|(index, _)| index)
             .collect()
@@ -784,9 +788,21 @@ impl Scratchpad {
         if matches.is_empty() {
             return;
         }
+        let (sel_start, sel_end) = self.document.selection_range();
+        let has_selection = sel_start != sel_end;
+        let len = matches.len() as isize;
         if let Some(palette) = &mut self.palette {
-            let current = palette.selected.min(matches.len() - 1) as isize;
-            palette.selected = (current + delta).clamp(0, matches.len() as isize - 1) as usize;
+            let mut current = palette.selected.min(matches.len() - 1) as isize;
+            // Skip entries that cannot run (selection-only with no selection).
+            // Bounded by `len` so an all-unavailable list never spins.
+            for _ in 0..len {
+                current = (current + delta).clamp(0, len - 1);
+                let index = matches[current as usize];
+                if transforms::is_available(&transforms::TRANSFORMS[index], has_selection) {
+                    break;
+                }
+            }
+            palette.selected = current as usize;
             cx.notify();
         }
     }
@@ -797,12 +813,48 @@ impl Scratchpad {
             return;
         }
         let selected = self.palette.as_ref().map_or(0, |palette| palette.selected);
-        let transform = &transforms::TRANSFORMS[matches[selected.min(matches.len() - 1)]];
-        let apply = transform.apply;
-        let (start, end) = self.document.selection_range();
-        let output = apply(&self.document.text()[start..end]);
+        let index = matches[selected.min(matches.len() - 1)];
+        let transform = transforms::TRANSFORMS[index];
+
+        let (sel_start, sel_end) = self.document.selection_range();
+        let has_selection = sel_start != sel_end;
+        if !transforms::is_available(&transform, has_selection) {
+            self.show_hint("Select text to transform", cx);
+            return;
+        }
+
+        // Resolve the read/write range from the transform's scope. Boop's
+        // `state.text` is the selection when one exists, else the whole buffer.
+        let (start, end) = match transform.scope {
+            transforms::Scope::Selection => (sel_start, sel_end),
+            transforms::Scope::FullText => (0, self.document.len()),
+            transforms::Scope::SelectionOrFullText => {
+                if has_selection {
+                    (sel_start, sel_end)
+                } else {
+                    (0, self.document.len())
+                }
+            }
+        };
+
+        let result = (transform.apply)(&self.document.text()[start..end]);
         self.palette = None;
-        self.replace_range(start, end, &output, window, cx);
+        self.palette_hover = None;
+        match result {
+            transforms::TransformResult::Replace(text) => {
+                self.replace_range(start, end, &text, window, cx);
+            }
+            transforms::TransformResult::ReplaceAndReport { text, message } => {
+                self.replace_range(start, end, &text, window, cx);
+                self.show_hint(message, cx);
+            }
+            transforms::TransformResult::Report(message) => {
+                self.show_hint(message, cx);
+            }
+            transforms::TransformResult::Error(message) => {
+                self.show_hint(message, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -1979,6 +2031,8 @@ impl Render for Scratchpad {
 
         let palette_overlay = self.palette.as_ref().map(|palette| {
             let matches = self.palette_matches();
+            let (sel_start, sel_end) = self.document.selection_range();
+            let has_selection = sel_start != sel_end;
             let mut items: Vec<AnyElement> = Vec::new();
             let selected_index = palette.selected.min(matches.len().saturating_sub(1));
             if matches.is_empty() {
@@ -1994,21 +2048,54 @@ impl Render for Scratchpad {
             for (position, transform_index) in matches.iter().enumerate() {
                 let transform = &transforms::TRANSFORMS[*transform_index];
                 let selected = position == selected_index;
+                let available = transforms::is_available(transform, has_selection);
+                let name_color = if !available {
+                    rgb(0x585b70)
+                } else if selected {
+                    rgb(0xcdd6f4)
+                } else {
+                    rgb(0xa6adc8)
+                };
+                let info_index = *transform_index;
+                let info_icon = div()
+                    .child("\u{24D8}")
+                    .text_color(rgb(0x6c7086))
+                    .id(("transform-info", info_index))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        if *hovered {
+                            this.palette_hover = Some(info_index);
+                        } else if this.palette_hover == Some(info_index) {
+                            this.palette_hover = None;
+                        }
+                        cx.notify();
+                    }));
                 let item = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
                     .px(px(8.0))
                     .py(px(4.0))
-                    .text_color(if selected {
-                        rgb(0xcdd6f4)
-                    } else {
-                        rgb(0xa6adc8)
-                    })
-                    .child(transform.name);
+                    .text_color(name_color)
+                    .child(transform.name)
+                    .child(info_icon);
                 let item = if selected {
                     item.bg(rgb(0x313244))
                 } else {
                     item
                 };
                 items.push(item.into_any_element());
+                if self.palette_hover == Some(*transform_index) {
+                    items.push(
+                        div()
+                            .px(px(8.0))
+                            .pb(px(4.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x9399b2))
+                            .child(transform.description)
+                            .into_any_element(),
+                    );
+                }
             }
 
             div()
