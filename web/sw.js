@@ -1,4 +1,4 @@
-// Zapslab service worker: offline app shell.
+// ZapSlab service worker: offline app shell.
 // App code (zapslab.js / zapslab_bg.wasm) is served network-first, so a deploy
 // is picked up even without a VERSION bump; bumping VERSION still purges the
 // old cache of the remaining assets on activate.

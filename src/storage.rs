@@ -5,12 +5,25 @@
 //! asynchronous, so `load`/`save` are `async` on both targets; the non-wasm
 //! stub returns immediately.
 //!
-//! The tiny, recently-used transform list stays in localStorage: it is well
-//! under quota and synchronous, which keeps the palette snappy.
+//! The tiny, recently-used transform list, the recent find queries, and the
+//! last find/replace dialog state stay in localStorage: they are well under
+//! quota and synchronous, which keeps the palette and find dialog snappy.
 //!
 //! Keys are versioned so the storage format can change without migrations: an
 //! older version is ignored and overwritten. The legacy localStorage text key
 //! (`zapslab.text.v1`) is migrated into IndexedDB once on first load.
+
+/// The find/replace dialog state persisted so reopening restores the last
+/// session. Defined outside the per-target `imp` modules; each only decides
+/// whether it can be stored (localStorage on wasm, nowhere on native).
+#[derive(Clone)]
+pub struct SavedFindState {
+    pub find: String,
+    pub replace: String,
+    pub regex: bool,
+    pub case_insensitive: bool,
+    pub replace_focused: bool,
+}
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
@@ -30,6 +43,10 @@ mod imp {
     /// Most-recently-used transform names, newest first. Versioned like the
     /// text key: an older/malformed value is ignored rather than migrated.
     const RECENT_KEY: &str = "zapslab.recent.v1";
+    /// Recent find queries, newest first (the view caps the list at 20).
+    const FINDS_KEY: &str = "zapslab.finds.v1";
+    /// The last find/replace dialog state, restored when the dialog reopens.
+    const FIND_STATE_KEY: &str = "zapslab.find-state.v1";
 
     thread_local! {
         /// The opened database, reused across reads and writes.
@@ -171,6 +188,51 @@ mod imp {
         let encoded = serde_json::to_string(names).map_err(|_| ())?;
         storage.set_item(RECENT_KEY, &encoded).map_err(|_| ())
     }
+
+    pub fn load_recent_finds() -> Vec<String> {
+        let Some(raw) = storage().and_then(|storage| storage.get_item(FINDS_KEY).ok().flatten())
+        else {
+            return Vec::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    pub fn save_recent_finds(finds: &[String]) -> Result<(), ()> {
+        let storage = storage().ok_or(())?;
+        let encoded = serde_json::to_string(finds).map_err(|_| ())?;
+        storage.set_item(FINDS_KEY, &encoded).map_err(|_| ())
+    }
+
+    pub fn load_find_state() -> Option<super::SavedFindState> {
+        let raw = storage().and_then(|storage| storage.get_item(FIND_STATE_KEY).ok().flatten())?;
+        let (find, replace, regex, case_insensitive, replace_focused): (
+            String,
+            String,
+            bool,
+            bool,
+            bool,
+        ) = serde_json::from_str(&raw).ok()?;
+        Some(super::SavedFindState {
+            find,
+            replace,
+            regex,
+            case_insensitive,
+            replace_focused,
+        })
+    }
+
+    pub fn save_find_state(state: &super::SavedFindState) -> Result<(), ()> {
+        let storage = storage().ok_or(())?;
+        let encoded = serde_json::to_string(&(
+            state.find.as_str(),
+            state.replace.as_str(),
+            state.regex,
+            state.case_insensitive,
+            state.replace_focused,
+        ))
+        .map_err(|_| ())?;
+        storage.set_item(FIND_STATE_KEY, &encoded).map_err(|_| ())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -190,6 +252,25 @@ mod imp {
     pub fn save_recent(_names: &[String]) -> Result<(), ()> {
         Ok(())
     }
+
+    pub fn load_recent_finds() -> Vec<String> {
+        Vec::new()
+    }
+
+    pub fn save_recent_finds(_finds: &[String]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    pub fn load_find_state() -> Option<super::SavedFindState> {
+        None
+    }
+
+    pub fn save_find_state(_state: &super::SavedFindState) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
-pub use imp::{load, load_recent, save, save_recent};
+pub use imp::{
+    load, load_find_state, load_recent, load_recent_finds, save, save_find_state, save_recent,
+    save_recent_finds,
+};

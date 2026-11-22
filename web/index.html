@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Zapslab</title>
+  <title>ZapSlab</title>
   <meta name="description" content="A self-contained scratchpad running on WebAssembly." />
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#11111b" />
@@ -32,10 +32,18 @@
   </style>
 </head>
 <body>
-  <div id="loading">loading Zapslab…</div>
-  <noscript>Zapslab requires JavaScript and WebAssembly.</noscript>
+  <div id="loading">loading ZapSlab…</div>
+  <noscript>ZapSlab requires JavaScript and WebAssembly.</noscript>
   <script type="module">
     import init from "./zapslab.js";
+
+    // gpui's web backend calls preventDefault() on every `contextmenu` event at
+    // its canvas, which suppresses the browser's native right-click menu. The
+    // canvas is appended to <body> and the listener is bubble-phase, so stopping
+    // propagation during the window's capture phase keeps the event from ever
+    // reaching it. Stopping propagation does not cancel the event, so the
+    // browser's normal context menu still opens.
+    window.addEventListener("contextmenu", (event) => event.stopPropagation(), true);
 
     init()
       .then(() => document.getElementById("loading")?.remove())

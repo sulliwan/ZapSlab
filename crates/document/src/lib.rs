@@ -1,4 +1,4 @@
-//! Pure document model for Zapslab.
+//! Pure document model for ZapSlab.
 //!
 //! Everything here is plain `std`: text, the byte-offset cursor/anchor, the
 //! incremental line index, the bounded undo/redo history, and the UTF-16 ⇄ byte
@@ -340,6 +340,35 @@ impl Document {
             last = next_grapheme_boundary(&self.text, last);
         }
         (first, last)
+    }
+
+    /// Counts the characters and words in `start..end`, as `(chars, words)`.
+    ///
+    /// A character is an extended grapheme cluster, matching the cursor
+    /// column's unit. Words use the same classification as [`Self::word_range_at`]:
+    /// maximal runs of alphanumeric or `_` clusters, so whitespace and
+    /// punctuation separate words but are not themselves words. Callers should
+    /// cache the result for a selection; counting is proportional to the
+    /// selected text, not the document.
+    pub fn selection_stats(&self, start: usize, end: usize) -> (usize, usize) {
+        let start = self.clamp_boundary(start);
+        let end = self.clamp_boundary(end.max(start));
+        let selection = &self.text[start..end];
+        let mut chars = 0;
+        let mut words = 0;
+        let mut in_word = false;
+        for (cluster_start, cluster_end) in crate::grapheme::grapheme_ranges(selection) {
+            chars += 1;
+            let is_word = selection[cluster_start..cluster_end]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if is_word && !in_word {
+                words += 1;
+            }
+            in_word = is_word;
+        }
+        (chars, words)
     }
 
     // ---- Editing --------------------------------------------------------
@@ -908,6 +937,34 @@ mod tests {
     #[test]
     fn word_range_of_empty_document_is_empty() {
         assert_eq!(doc("").word_range_at(0), (0, 0));
+    }
+
+    #[test]
+    fn selection_stats_counts_graphemes_and_words() {
+        let document = doc("foo bar,baz");
+        assert_eq!(document.selection_stats(0, 11), (11, 3));
+        assert_eq!(document.selection_stats(4, 7), (3, 1));
+        // Whitespace and punctuation split words but are not words.
+        assert_eq!(document.selection_stats(3, 8), (5, 1));
+        assert_eq!(document.selection_stats(7, 8), (1, 0));
+    }
+
+    #[test]
+    fn selection_stats_counts_clusters_not_scalars() {
+        // Combined mark: one character, one word.
+        let document = doc("e\u{301}x y");
+        assert_eq!(document.selection_stats(0, 6), (4, 2));
+        // Astral emoji: one character but not a word.
+        let document = doc("a😀b");
+        assert_eq!(document.selection_stats(0, 6), (3, 2));
+    }
+
+    #[test]
+    fn selection_stats_of_empty_and_clamped_ranges() {
+        let document = doc("hello");
+        assert_eq!(document.selection_stats(2, 2), (0, 0));
+        assert_eq!(document.selection_stats(0, 99), (5, 1));
+        assert_eq!(document.selection_stats(3, 1), (0, 0));
     }
 
     #[test]

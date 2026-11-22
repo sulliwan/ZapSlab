@@ -7,14 +7,14 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Date to Timestamp",
-        description: "Converts dates to Unix timestamp.",
+        description: "Parse a date/time to Unix seconds; naive inputs are treated as UTC, sub-second precision is dropped, and unparseable input is an error.",
         tags: "date,time,calendar,unix,timestamp",
         scope: Scope::SelectionOrFullText,
         apply: date_to_timestamp,
     },
     Transform {
         name: "Date to UTC",
-        description: "Converts dates and timestamps to UTC dates",
+        description: "Parse a date/time or Unix seconds and format it as a GMT string; naive inputs are treated as UTC.",
         tags: "date,time,calendar,unix,timestamp",
         scope: Scope::SelectionOrFullText,
         apply: date_to_utc,

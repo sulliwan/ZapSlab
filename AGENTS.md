@@ -1,14 +1,15 @@
 # AGENTS.md
 
-Guidance for contributors and coding agents working on **Zapslab**. Read this
+Guidance for contributors and coding agents working on **ZapSlab**. Read this
 before changing code; it captures the conventions the project follows,
 including the split between the pure document model and the gpui view.
 
 ## What this is
 
-Zapslab is a WASM/GPUI scratchpad editor, similar in spirit to Boop, shipped as
+ZapSlab is a WASM/GPUI scratchpad editor, similar in spirit to Boop, shipped as
 an installable PWA. A single window hosts a plain-text editor with soft wrap,
-selection, undo/redo, a transform palette, and IndexedDB autosave. It targets
+selection, undo/redo, a transform palette, a find/replace dialog, and IndexedDB
+autosave. It targets
 documents up to 64 MB: rendering is virtualized (only visible rows are built)
 and the pure model keeps an incremental line index so edits do not scan the
 whole buffer. It is a small codebase with a deliberately thin, pure core and a
@@ -19,7 +20,11 @@ gpui rendering shell.
 ```
 src/                 root crate `zapslab` (gpui view + platform glue)
   main.rs            bootstrap, window creation, embedded fonts
-  app.rs             Scratchpad: rendering, geometry, input, palette, scrollbars
+  app.rs             Scratchpad: rendering, geometry, input, palette,
+                     find/replace dialog, scrollbars
+  commands.rs        palette commands that open UI (find / find-replace)
+  find.rs            pure find/replace engine (regex + literal, capture expansion,
+                     one-step replace-all)
   storage.rs         IndexedDB document + localStorage recent list
                      (wasm-only + non-wasm stub)
   transforms/        pure transform registry (mod.rs + category submodules;
@@ -46,6 +51,11 @@ Treat that crate as the home for all non-gpui logic described below; the gpui
 `Scratchpad` view delegates text, cursor, the incremental line index, UTF-16
 mapping, and undo work to it. The document is a flat `String` plus indices (no
 rope); the invariants that keep edits off the whole buffer are described below.
+
+The one deliberate exception is `src/find.rs`: it is pure (no gpui/wasm) but
+lives in the root crate because it depends on `regex`, which is already a root
+dependency via gpui and is not part of the document crate's std-only + Unicode
+dependency set. Keep `crates/document` free of `regex`.
 
 ## Build, check, test, and serve
 
@@ -162,6 +172,19 @@ Rules:
   limit message otherwise);
 - **expensive-transform confirmation**: `transforms::is_expensive` plus a 2 MB
   input threshold opens a modal instead of blocking the UI;
+- **find/replace**: `Ctrl/Cmd+F` toggles a modal dialog (`Ctrl/Cmd+Shift+F` is a
+  fallback where the browser reserves Ctrl+F). The pure engine is `src/find.rs`;
+  `Scratchpad` owns the dialog state, key/input routing, and the overlay.
+  Literal and regex searches share one matcher (literal queries are escaped),
+  with a regex toggle and a Unicode-aware case-insensitive toggle. Each field
+  keeps its own grapheme-aware caret (arrows, Home/End, Backspace/Delete), and
+  typed text inserts at that caret. Reopening restores the last closed dialog
+  state (query, replacement, toggles, focused field), and Up/Down in the query
+  field recall the 20 most recent queries. Find navigation reuses the document
+  selection to highlight the current match, so
+  "replace all in selection" uses a selection snapshot taken when the dialog
+  opens. Replace-all applies as a single `replace_range` (one undo step) and is
+  size-capped before mutating;
 - **hex pane**: a virtualized `HexIndex` (only visible rows are materialized,
   carried by spacers) cached by `(document revision, encoding, bytes_per_row)`;
   hit-testing maps encoded byte offsets back to text through the same index. It
@@ -192,7 +215,9 @@ keep the public signatures identical across both.
 
 - **Document text → IndexedDB**: database `zapslab`, object store `documents`,
   key `text.v1`. **Recent transforms → localStorage** (`zapslab.recent.v1`,
-  small and synchronous).
+  small and synchronous). The find dialog's last state (`zapslab.find-state.v1`)
+  and recent queries (`zapslab.finds.v1`) also live in localStorage; the state
+  is restored on reopen and the query list is capped at 20.
 - `load`/`save` are **async** on both targets. IndexedDB requests are bridged to
   Rust futures with `wasm-bindgen-futures`; the wasm-only deps are `js-sys` and
   `wasm-bindgen-futures`, and `web-sys` enables the `Idb*` features.
@@ -287,6 +312,10 @@ keep the public signatures identical across both.
   them through the containerized target, not host cargo for the root crate.
   Because the root crate pulls in gpui, the pure transform tests are easiest to
   run via a small standalone crate that path-includes `src/transforms/mod.rs`.
+- `src/find.rs`'s engine follows the same pattern: keep `#[cfg(test)] mod tests`
+  alongside it and run it through a standalone crate that path-includes
+  `src/find.rs`. `cargo check --tests --target wasm32-unknown-unknown` only type-
+  checks those tests; the standalone crate is what actually runs them.
 
 ## Definition of done
 
@@ -295,7 +324,9 @@ keep the public signatures identical across both.
 - [ ] Hot-path edits do not scan the whole buffer (line index / grapheme / UTF-16
       stay incremental or local).
 - [ ] Input that would exceed `MAX_DOCUMENT_BYTES` is refused before mutating.
-- [ ] Pure logic lives in `crates/document`; no gpui/wasm imports there.
+- [ ] Pure model logic lives in `crates/document`; no gpui/wasm imports there.
+      The find engine (`src/find.rs`) is the deliberate exception: pure, but in
+      the root crate for its `regex` dependency.
 - [ ] Public signatures stay uniform across wasm and non-wasm builds.
 - [ ] Errors that affect the user are surfaced (especially autosave).
 - [ ] Constants are named; invariants are documented with *why* comments.
@@ -317,6 +348,19 @@ keep the public signatures identical across both.
   buffer (an explicit, user-initiated transformation).
 - **Wrap-on layout rebuild is O(lines log n)** and only runs for documents below
   the auto-disable thresholds; large buffers use wrap-off with O(1) row mapping.
+- **Find/replace is a modal dialog.** While it is open, typing goes to its
+  fields and the editor behind it is occluded, so the selection can only change
+  through find. "Replace all in selection" therefore uses the selection captured
+  at open time, not the live selection (which find moves onto each match).
+- **Regex "find prev" is O(matches).** Backward search has no native regex API,
+  so it scans forward up to the cursor; literal backward search is
+  `str::rfind`-fast. The dialog shows No matches / Wrapped instead of a live
+  total count, which would rescan on every keystroke. Regex and replace-all
+  whole-buffer cost is accepted as user-initiated work.
+- **Browser `Ctrl+F` may not be interceptable.** In some browsers a normal tab
+  reserves `Ctrl/Cmd+F`, so `preventDefault` may not suppress native find even
+  though the key is handled. Verify in the installed PWA; `Ctrl/Cmd+Shift+F` and
+  the palette commands are the fallbacks.
 - **Pixel geometry is `f32`.** Very high row counts (tens of millions) can lose
   scroll precision; typical 64 MB text is well within limits.
 
@@ -325,6 +369,6 @@ keep the public signatures identical across both.
 Raise decisions with product or UX tradeoffs with the user instead of guessing.
 Examples: the 64 MB cap and refusal wording, autosave debounce and failure UI,
 undo-history strategy (snapshot vs. delta), wrap auto-disable thresholds and
-scrollbar behavior, palette interaction and keybindings, and whether a transform
-should preserve or replace selection. Implement the mechanical part; ask before
-locking in a user-visible behavior change.
+scrollbar behavior, palette and find/replace interaction and keybindings, and
+whether a transform should preserve or replace selection. Implement the
+mechanical part; ask before locking in a user-visible behavior change.

@@ -4,7 +4,7 @@ use super::{Scope, Transform, TransformResult};
 
 pub const TRANSFORMS: &[Transform] = &[Transform {
     name: "Hex to RGB",
-    description: "Convert color in hexadecimal to RGB.",
+    description: "Convert a #RRGGBB color (optional '#') to decimal R,G,B; 3-digit shorthand is not expanded and invalid digits become NaN.",
     tags: "hex,color,rgb,convert",
     scope: Scope::SelectionOrFullText,
     apply: hex_to_rgb,
@@ -80,7 +80,10 @@ mod tests {
     fn registers_boop_metadata() {
         assert_eq!(TRANSFORMS.len(), 1);
         assert_eq!(TRANSFORMS[0].name, "Hex to RGB");
-        assert_eq!(TRANSFORMS[0].description, "Convert color in hexadecimal to RGB.");
+        assert_eq!(
+            TRANSFORMS[0].description,
+            "Convert a #RRGGBB color (optional '#') to decimal R,G,B; 3-digit shorthand is not expanded and invalid digits become NaN."
+        );
         assert_eq!(TRANSFORMS[0].tags, "hex,color,rgb,convert");
     }
 

@@ -3,21 +3,21 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Count Characters",
-        description: "Get the length of your text",
+        description: "Report the UTF-16 code-unit length (astral characters count as two); the text is left unchanged.",
         tags: "count,length,size,character",
         scope: Scope::SelectionOrFullText,
         apply: count_characters,
     },
     Transform {
         name: "Count Lines",
-        description: "Get the line count of your text",
+        description: "Report the line count (a trailing newline adds a final empty line); the text is left unchanged.",
         tags: "count,length,size,line",
         scope: Scope::SelectionOrFullText,
         apply: count_lines,
     },
     Transform {
         name: "Count Words",
-        description: "Get the word count of your text",
+        description: "Report the number of whitespace-separated words; the text is left unchanged.",
         tags: "count,length,size,words",
         scope: Scope::SelectionOrFullText,
         apply: count_words,

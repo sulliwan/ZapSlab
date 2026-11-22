@@ -8,98 +8,98 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Base64 Encode",
-        description: "Encodes your text to Base64",
+        description: "Encode the text as standard Base64.",
         tags: "base64,atob,encode",
         scope: Scope::SelectionOrFullText,
         apply: base64_encode,
     },
     Transform {
         name: "Base64 Decode",
-        description: "Decodes your text from Base64",
+        description: "Decode standard or URL-safe Base64 to UTF-8 text; whitespace and padding are ignored and invalid input is an error.",
         tags: "base64,btoa,decode",
         scope: Scope::SelectionOrFullText,
         apply: base64_decode,
     },
     Transform {
         name: "HTML Encode",
-        description: "Encodes HTML entities in your text",
+        description: "Escape HTML-sensitive characters and non-ASCII code points as hex numeric entities.",
         tags: "html,encode,web",
         scope: Scope::SelectionOrFullText,
         apply: html_encode,
     },
     Transform {
         name: "HTML Decode",
-        description: "Decodes HTML entities in your text",
+        description: "Decode named, numeric, and hex HTML character entities.",
         tags: "html,decode,web",
         scope: Scope::SelectionOrFullText,
         apply: html_decode,
     },
     Transform {
         name: "HTML Encode all characters",
-        description: "HTML Encodes every character in your text",
+        description: "Escape every UTF-16 code unit as a decimal numeric entity; astral characters become two references.",
         tags: "html,encode,web,email",
         scope: Scope::SelectionOrFullText,
         apply: html_encode_all,
     },
     Transform {
         name: "URL Encode",
-        description: "Encodes URL entities in your text.",
+        description: "Percent-encode the text as a URL component (like encodeURIComponent).",
         tags: "url,encode,convert",
         scope: Scope::SelectionOrFullText,
         apply: url_encode,
     },
     Transform {
         name: "URL Decode",
-        description: "Decodes URL entities in your text.",
+        description: "Decode percent-encoded text as UTF-8; malformed escapes are an error.",
         tags: "url,decode,convert",
         scope: Scope::SelectionOrFullText,
         apply: url_decode,
     },
     Transform {
         name: "URL Entity Encode",
-        description: "URL Encodes all characters in your text.",
+        description: "Percent-encode every UTF-16 code unit as lowercase hex, including letters and digits.",
         tags: "url,encode,full",
         scope: Scope::SelectionOrFullText,
         apply: url_entities_encode,
     },
     Transform {
         name: "URL Entities Decode",
-        description: "URL Decodes all characters in your text.",
+        description: "Decode %XX hex runs as UTF-16 code units; sequences that are not valid UTF-16 are an error.",
         tags: "url,decode,full",
         scope: Scope::SelectionOrFullText,
         apply: url_entities_decode,
     },
     Transform {
         name: "Defang",
-        description: "Defangs dangerous URLs and other IOCs",
+        description: "Neutralize URLs and indicators of compromise (hXXp://, [.]) so they are not clickable; Refang reverses it.",
         tags: "defang,url,ioc",
         scope: Scope::SelectionOrFullText,
         apply: url_defang,
     },
     Transform {
         name: "Refang",
-        description: "Removes defanging from dangerous URLs and other IOCs",
+        description: "Restore defanged URLs and indicators (hXXp -> http, [.] -> .); the inverse of Defang.",
         tags: "refang,url,ioc",
         scope: Scope::SelectionOrFullText,
         apply: url_refang,
     },
     Transform {
         name: "Add Slashes",
-        description: "Escapes your text.",
+        description: "Escape backslashes, single/double quotes, and NUL with a leading backslash (PHP addslashes style).",
         tags: "add,slashes,escape",
         scope: Scope::SelectionOrFullText,
         apply: add_slashes,
     },
     Transform {
         name: "Remove Slashes",
-        description: "Unescapes your text.",
+        description: "Remove one level of backslash escaping; the inverse of Add Slashes.",
         tags: "strip,slashes,remove,unescape",
         scope: Scope::SelectionOrFullText,
         apply: remove_slashes,
     },
     Transform {
         name: "Fish PATH Hex Converter",
-        description: "Escapes terminal characters.",
+        description: "Escape shell-significant characters as \\xNN for fish variable assignments; spaces become \\x:.",
         tags: "fish_user_paths, fish, hex, ascii, path, var",
         scope: Scope::SelectionOrFullText,
         apply: fish_hex_path_converter,
@@ -436,7 +436,7 @@ mod tests {
     fn base64_round_trips_and_matches_known_vectors() {
         assert_eq!(replaced(base64_encode("hello")), "aGVsbG8=");
 
-        let sample = "Zapslab — café 😀";
+        let sample = "ZapSlab — café 😀";
         let encoded = replaced(base64_encode(sample));
         assert_eq!(replaced(base64_decode(&encoded)), sample);
     }
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(replaced(url_entities_decode("%3a9")), "Ω");
         assert_eq!(replaced(url_entities_decode("%d83d%de00")), "😀");
 
-        let sample = "Zapslab test 123! é 😀\n";
+        let sample = "ZapSlab test 123! é 😀\n";
         assert_eq!(
             replaced(url_entities_decode(&replaced(url_entities_encode(sample)))),
             sample

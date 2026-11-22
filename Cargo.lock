@@ -5409,6 +5409,7 @@ dependencies = [
  "js-sys",
  "md-5",
  "percent-encoding",
+ "regex",
  "serde_json",
  "serde_yaml_ng",
  "sha1_smol",

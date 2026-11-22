@@ -34,8 +34,9 @@ use gpui::{
     ScrollHandle, StatefulInteractiveElement, Styled, StyledText, Subscription, Task, UTF16Selection,
     Window, canvas, div, fill, font, point, px, rgb, rgba, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{storage, transforms};
+use crate::{commands, find, storage, transforms};
 
 const FONT_SIZE: f32 = 16.0;
 /// Smaller monospace size for the dense hex dump.
@@ -60,6 +61,8 @@ const SAVE_DEBOUNCE_LARGE: Duration = Duration::from_secs(2);
 const TRANSFORM_CONFIRM_BYTES: usize = 2 * 1024 * 1024;
 /// Keep the recently-used list short enough to scan at a glance.
 const RECENT_TRANSFORMS_MAX: usize = 8;
+/// Recent find queries retained for Up/Down recall in the find dialog.
+const MAX_RECENT_FINDS: usize = 20;
 /// How long a transient status-bar hint stays visible.
 const HINT_DURATION: Duration = Duration::from_millis(3600);
 /// Default hex panel width as a fraction of the viewport.
@@ -190,6 +193,136 @@ impl Render for PaletteTooltip {
     }
 }
 
+/// Which field of the find/replace dialog receives typed input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindField {
+    Find,
+    Replace,
+}
+
+/// Floating find/replace dialog state.
+///
+/// `matcher` and `current` are derived from `find`/`regex`/`case_insensitive`
+/// and rebuilt by `refresh_find` on every query change, never per frame.
+/// `error` holds a regex compile failure so the dialog can show it inline.
+struct FindState {
+    find: String,
+    replace: String,
+    /// Byte-offset caret within `find`, always a char boundary.
+    find_caret: usize,
+    /// Byte-offset caret within `replace`, always a char boundary.
+    replace_caret: usize,
+    field: FindField,
+    regex: bool,
+    case_insensitive: bool,
+    matcher: Option<find::Matcher>,
+    error: Option<String>,
+    current: Option<(usize, usize)>,
+    wrapped: bool,
+    /// Index into the view's recent-finds list while browsing it with Up/Down;
+    /// `None` when editing the live query.
+    history_index: Option<usize>,
+    /// The live query stashed when history browsing starts, restored by Down.
+    history_draft: Option<String>,
+    /// The document selection at the moment the dialog opened. Find navigation
+    /// reuses the document selection to highlight matches, so "replace all in
+    /// selection" must remember the user's original range instead.
+    selection: Option<(usize, usize)>,
+}
+
+impl FindState {
+    fn active(&self) -> &String {
+        match self.field {
+            FindField::Find => &self.find,
+            FindField::Replace => &self.replace,
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut String {
+        match self.field {
+            FindField::Find => &mut self.find,
+            FindField::Replace => &mut self.replace,
+        }
+    }
+
+    fn caret(&self) -> usize {
+        match self.field {
+            FindField::Find => self.find_caret,
+            FindField::Replace => self.replace_caret,
+        }
+    }
+
+    fn set_caret(&mut self, caret: usize) {
+        match self.field {
+            FindField::Find => self.find_caret = caret,
+            FindField::Replace => self.replace_caret = caret,
+        }
+    }
+
+    fn reset_history(&mut self) {
+        self.history_index = None;
+        self.history_draft = None;
+    }
+}
+
+/// One row in the transform palette. Commands (which open UI) and transforms
+/// (which rewrite text) share one list so the palette stays a single search.
+#[derive(Clone, Copy)]
+enum PaletteEntry {
+    Transform(usize),
+    Command(usize),
+}
+
+fn palette_entry_available(entry: PaletteEntry, has_selection: bool) -> bool {
+    match entry {
+        PaletteEntry::Transform(index) => {
+            transforms::is_available(&transforms::TRANSFORMS[index], has_selection)
+        }
+        PaletteEntry::Command(_) => true,
+    }
+}
+
+/// Snap `at` into `text` and down to a char boundary.
+fn snap_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn previous_grapheme_start(text: &str, caret: usize) -> usize {
+    text[..caret]
+        .grapheme_indices(true)
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_grapheme_end(text: &str, caret: usize) -> usize {
+    text[caret..]
+        .grapheme_indices(true)
+        .next()
+        .map(|(_, grapheme)| caret + grapheme.len())
+        .unwrap_or(text.len())
+}
+
+/// Renders a field's text with an inline block caret at `caret` (byte offset)
+/// when the field is active. The caret is an inserted glyph, matching the
+/// palette/jump prompts; it shifts following text by one cell, which is fine for
+/// these short fields.
+fn field_display(text: &str, caret: usize, active: bool) -> String {
+    if !active {
+        return text.to_string();
+    }
+    let caret = snap_boundary(text, caret);
+    let mut out = String::with_capacity(text.len() + 3);
+    out.push_str(&text[..caret]);
+    out.push('\u{258F}');
+    out.push_str(&text[caret..]);
+    out
+}
+
 #[derive(Clone, Copy)]
 struct ScrollDrag {
     /// Distance from the pointer to the thumb's left edge, in pixels.
@@ -280,6 +413,8 @@ pub struct Scratchpad {
     caret_visible: bool,
     word_wrap: bool,
     palette: Option<Palette>,
+    /// Floating find/replace dialog; `None` when closed.
+    find: Option<FindState>,
     /// Set when an expensive transform needs confirmation before running.
     pending_transform: Option<PendingTransform>,
     /// Scroll position of the transform list. Reset when the palette opens or
@@ -288,6 +423,10 @@ pub struct Scratchpad {
     /// Recently applied transform names, newest first. Persisted in
     /// localStorage and used to float them to the top of the empty palette.
     recent_transforms: Vec<String>,
+    /// Recent find queries, newest first, capped at `MAX_RECENT_FINDS`.
+    recent_finds: Vec<String>,
+    /// Last closed find/replace dialog state, restored when it reopens.
+    last_find: Option<storage::SavedFindState>,
     /// Render non-printing/invisible characters as colored escape sequences.
     /// On by default: the buffer is often inspected as near-binary data.
     show_invisibles: bool,
@@ -318,6 +457,16 @@ pub struct Scratchpad {
     encoding_prompt: Option<EncodingPrompt>,
     /// Inline editor for a single hex byte, opened by double-clicking it.
     byte_edit: Option<ByteEdit>,
+    /// Modal for jumping to a 1-based line number, opened from the status bar.
+    jump_prompt: Option<String>,
+    /// Cached "L: x/y, C: z" label, keyed by `(document revision, cursor)`, so
+    /// the status bar does not rescan the current line on every caret blink.
+    cursor_status_cache: Option<(u64, usize, String)>,
+    /// Cached "S: n,W: m" selection label, keyed by
+    /// `(revision, selection start, selection end)`. A selection can span the
+    /// whole document, so counting it on every frame (caret blink) would be a
+    /// repeated full scan; selection moves and edits both invalidate the key.
+    selection_status_cache: Option<(u64, usize, usize, String)>,
     scroll_handle: ScrollHandle,
     scroll_drag: Option<ScrollDrag>,
     /// Active drag on the vertical scrollbar thumb.
@@ -388,9 +537,12 @@ impl Scratchpad {
             dragging: false,
             caret_visible: true,
             palette: None,
+            find: None,
             pending_transform: None,
             palette_scroll: ScrollHandle::default(),
             recent_transforms: storage::load_recent(),
+            recent_finds: storage::load_recent_finds(),
+            last_find: storage::load_find_state(),
             show_invisibles: true,
             word_wrap,
             hex_panel: false,
@@ -406,6 +558,9 @@ impl Scratchpad {
             hex_line_height: Cell::new(HEX_FONT_SIZE * LINE_HEIGHT_RATIO),
             encoding_prompt: None,
             byte_edit: None,
+            jump_prompt: None,
+            cursor_status_cache: None,
+            selection_status_cache: None,
             scroll_handle: ScrollHandle::default(),
             scroll_drag: None,
             v_scroll_drag: None,
@@ -1117,6 +1272,37 @@ impl Scratchpad {
             return true;
         }
 
+        // The jump-to-line prompt is modal: digits build the line number, Enter
+        // jumps, and Escape cancels.
+        if self.jump_prompt.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.jump_prompt = None;
+                    window.notify_text_input_changed(&self.focus_handle);
+                    cx.notify();
+                }
+                "enter" => self.apply_jump_prompt(window, cx),
+                "backspace" => {
+                    if let Some(value) = &mut self.jump_prompt {
+                        value.pop();
+                    }
+                    cx.notify();
+                }
+                "left" | "right" | "home" | "end" | "tab" | "delete" => {}
+                _ => {
+                    // On web, printable keys fall through to the input handler.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(text) = &keystroke.key_char {
+                        self.push_jump_digits(text);
+                        cx.notify();
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // The transform confirmation is modal: Enter runs it, Escape cancels.
         if self.pending_transform.is_some() {
             match keystroke.key.as_str() {
@@ -1125,6 +1311,10 @@ impl Scratchpad {
                 _ => {}
             }
             return true;
+        }
+
+        if self.find.is_some() {
+            return self.handle_find_key_down(event, window, cx);
         }
 
         if self.palette.is_some() {
@@ -1145,6 +1335,10 @@ impl Scratchpad {
                 // Ctrl+Shift+Space is kept as a fallback where K is taken.
                 "k" => self.open_palette(window, cx),
                 "space" if modifiers.shift => self.open_palette(window, cx),
+                // Ctrl/Cmd+F toggles find/replace. Ctrl/Cmd+Shift+F is a fallback
+                // where the browser reserves Ctrl+F; shift does not change `key`,
+                // so the same arm covers both.
+                "f" => self.open_find(window, cx),
                 "z" if modifiers.shift => self.redo(window, cx),
                 "z" => self.undo(window, cx),
                 _ => return false,
@@ -1207,7 +1401,7 @@ impl Scratchpad {
                 window.notify_text_input_changed(&self.focus_handle);
                 cx.notify();
             }
-            "enter" => self.apply_selected_transform(window, cx),
+            "enter" => self.apply_selected_palette_entry(window, cx),
             "up" => self.move_palette_selection(-1, cx),
             "down" => self.move_palette_selection(1, cx),
             "backspace" => {
@@ -1245,6 +1439,738 @@ impl Scratchpad {
         cx.notify();
     }
 
+    // ---- Find / replace -------------------------------------------------
+
+    /// Ctrl/Cmd+F toggles the floating find/replace dialog. Reopening restores
+    /// the last closed dialog state; on the first open it seeds the query from
+    /// the current single-line selection and jumps to the first match at or
+    /// after the selection start.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_some() {
+            self.close_find(window, cx);
+            return;
+        }
+        let (sel_start, sel_end) = self.document.selection_range();
+        let selection = if sel_start != sel_end {
+            Some((sel_start, sel_end))
+        } else {
+            None
+        };
+
+        let (find, replace, regex, case_insensitive, field) = match self.last_find.clone() {
+            Some(saved) => (
+                saved.find,
+                saved.replace,
+                saved.regex,
+                saved.case_insensitive,
+                if saved.replace_focused {
+                    FindField::Replace
+                } else {
+                    FindField::Find
+                },
+            ),
+            None => {
+                let seed = match selection {
+                    Some((start, end)) => {
+                        let text = &self.document.text()[start..end];
+                        if !text.contains('\n') && text.len() <= 512 {
+                            text.to_string()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    None => String::new(),
+                };
+                (seed, String::new(), false, false, FindField::Find)
+            }
+        };
+
+        let find_caret = find.len();
+        let replace_caret = replace.len();
+        self.find = Some(FindState {
+            find,
+            replace,
+            find_caret,
+            replace_caret,
+            field,
+            regex,
+            case_insensitive,
+            matcher: None,
+            error: None,
+            current: None,
+            wrapped: false,
+            history_index: None,
+            history_draft: None,
+            selection,
+        });
+        self.palette = None;
+        self.refresh_find(sel_start);
+        window.notify_text_input_changed(&self.focus_handle);
+        if let Some(range) = self.find.as_ref().and_then(|state| state.current) {
+            self.select_match(range, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opened from the palette command: same dialog, replacement field focused.
+    fn open_find_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            self.open_find(window, cx);
+        }
+        if let Some(state) = &mut self.find {
+            state.field = FindField::Replace;
+        }
+        self.palette = None;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Remember the dialog for the next open and surface the query in the
+        // recent-finds history. Storage failures are harmless UI-only state; the
+        // in-memory `last_find` still restores it for this session.
+        let saved = self.find.as_ref().map(|state| storage::SavedFindState {
+            find: state.find.clone(),
+            replace: state.replace.clone(),
+            regex: state.regex,
+            case_insensitive: state.case_insensitive,
+            replace_focused: state.field == FindField::Replace,
+        });
+        if let Some(saved) = saved {
+            let _ = storage::save_find_state(&saved);
+            self.last_find = Some(saved);
+        }
+        self.record_find();
+        self.find = None;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Records the current query in the recent-finds list (newest first,
+    /// deduplicated, capped) and persists it. Invalid regexes are not recorded.
+    fn record_find(&mut self) {
+        let Some((query, invalid)) = self
+            .find
+            .as_ref()
+            .map(|state| (state.find.clone(), state.error.is_some()))
+        else {
+            return;
+        };
+        if query.is_empty() || invalid {
+            return;
+        }
+        self.recent_finds.retain(|existing| existing != &query);
+        self.recent_finds.insert(0, query);
+        self.recent_finds.truncate(MAX_RECENT_FINDS);
+        let _ = storage::save_recent_finds(&self.recent_finds);
+        if let Some(state) = &mut self.find {
+            state.reset_history();
+        }
+    }
+
+    /// Up in the Find field: step to older recent queries.
+    fn find_history_prev(&mut self, cx: &mut Context<Self>) {
+        let Some((index, draft, query)) = (|| {
+            let state = self.find.as_ref()?;
+            if state.field != FindField::Find || self.recent_finds.is_empty() {
+                return None;
+            }
+            let index = match state.history_index {
+                Some(index) => (index + 1).min(self.recent_finds.len() - 1),
+                None => 0,
+            };
+            let draft = state
+                .history_draft
+                .clone()
+                .unwrap_or_else(|| state.find.clone());
+            let query = self.recent_finds[index].clone();
+            Some((index, draft, query))
+        })() else {
+            return;
+        };
+
+        if let Some(state) = &mut self.find {
+            state.history_index = Some(index);
+            state.history_draft = Some(draft);
+            state.find = query;
+            let len = state.find.len();
+            state.find_caret = len;
+        }
+        self.after_find_query_changed(cx);
+    }
+
+    /// Down in the Find field: step toward newer queries, restoring the stashed
+    /// draft after the newest entry.
+    fn find_history_next(&mut self, cx: &mut Context<Self>) {
+        let Some((index, query)) = (|| {
+            let state = self.find.as_ref()?;
+            if state.field != FindField::Find {
+                return None;
+            }
+            let index = state.history_index?;
+            if index == 0 {
+                Some((None, state.history_draft.clone().unwrap_or_default()))
+            } else {
+                let previous = index - 1;
+                Some((Some(previous), self.recent_finds.get(previous)?.clone()))
+            }
+        })() else {
+            return;
+        };
+
+        if let Some(state) = &mut self.find {
+            state.find = query;
+            let len = state.find.len();
+            state.find_caret = len;
+            state.history_index = index;
+            if index.is_none() {
+                state.history_draft = None;
+            }
+        }
+        self.after_find_query_changed(cx);
+    }
+
+    fn handle_find_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+
+        // Ctrl/Cmd+F toggles the dialog closed, mirroring how it opened it.
+        if (modifiers.platform || modifiers.control) && keystroke.key == "f" {
+            self.close_find(window, cx);
+            return true;
+        }
+
+        match keystroke.key.as_str() {
+            "escape" => self.close_find(window, cx),
+            "enter" => {
+                if modifiers.shift {
+                    self.find_prev_match(window, cx);
+                } else if self
+                    .find
+                    .as_ref()
+                    .is_some_and(|state| state.field == FindField::Replace)
+                {
+                    self.replace_current(window, cx);
+                } else {
+                    self.find_next_match(window, cx);
+                }
+            }
+            "tab" => {
+                self.toggle_find_field(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "backspace" => {
+                self.backspace_find(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "delete" => {
+                self.delete_forward_find(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "left" => {
+                self.move_find_caret(false, cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "right" => {
+                self.move_find_caret(true, cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "home" => {
+                self.move_find_caret_home(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "end" => {
+                self.move_find_caret_end(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "up" => {
+                self.find_history_prev(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            "down" => {
+                self.find_history_next(cx);
+                window.notify_text_input_changed(&self.focus_handle);
+            }
+            _ => {
+                // On web, printable keys fall through to the input handler,
+                // which appends them to the active field.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(text) = &keystroke.key_char {
+                    self.push_find_text(text, cx);
+                    return true;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn toggle_find_field(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.find {
+            state.field = match state.field {
+                FindField::Find => FindField::Replace,
+                FindField::Replace => FindField::Find,
+            };
+            cx.notify();
+        }
+    }
+
+    fn toggle_find_regex(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.find else {
+            return;
+        };
+        state.regex = !state.regex;
+        self.after_find_query_changed(cx);
+    }
+
+    fn toggle_find_case_insensitive(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.find else {
+            return;
+        };
+        state.case_insensitive = !state.case_insensitive;
+        self.after_find_query_changed(cx);
+    }
+
+    // Native printable keys are handled here; on web they fall through to the
+    // input handler instead, so this is only referenced by the native path.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn push_find_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let editing_find = {
+            let Some(state) = &mut self.find else {
+                return;
+            };
+            let caret = snap_boundary(state.active(), state.caret());
+            state.active_mut().insert_str(caret, text);
+            state.set_caret(caret + text.len());
+            let editing_find = state.field == FindField::Find;
+            if editing_find {
+                state.reset_history();
+            }
+            editing_find
+        };
+        if editing_find {
+            self.after_find_query_changed(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Deletes the grapheme before the active field's caret.
+    fn backspace_find(&mut self, cx: &mut Context<Self>) {
+        let (deletion, editing_find) = {
+            let Some(state) = &self.find else {
+                return;
+            };
+            let text = state.active();
+            let caret = snap_boundary(text, state.caret());
+            let previous = if caret == 0 {
+                None
+            } else {
+                Some(previous_grapheme_start(text, caret))
+            };
+            (
+                previous.map(|previous| (previous, caret)),
+                state.field == FindField::Find,
+            )
+        };
+
+        let Some((previous, caret)) = deletion else {
+            cx.notify();
+            return;
+        };
+        if let Some(state) = &mut self.find {
+            state.active_mut().replace_range(previous..caret, "");
+            state.set_caret(previous);
+            if editing_find {
+                state.reset_history();
+            }
+        }
+        if editing_find {
+            self.after_find_query_changed(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Deletes the grapheme after the active field's caret.
+    fn delete_forward_find(&mut self, cx: &mut Context<Self>) {
+        let (deletion, editing_find) = {
+            let Some(state) = &self.find else {
+                return;
+            };
+            let text = state.active();
+            let caret = snap_boundary(text, state.caret());
+            let next = if caret >= text.len() {
+                None
+            } else {
+                Some(next_grapheme_end(text, caret))
+            };
+            (
+                next.map(|next| (caret, next)),
+                state.field == FindField::Find,
+            )
+        };
+
+        let Some((caret, next)) = deletion else {
+            cx.notify();
+            return;
+        };
+        if let Some(state) = &mut self.find {
+            state.active_mut().replace_range(caret..next, "");
+            state.set_caret(caret);
+            if editing_find {
+                state.reset_history();
+            }
+        }
+        if editing_find {
+            self.after_find_query_changed(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Moves the active field's caret one grapheme left or right.
+    fn move_find_caret(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.find else {
+            return;
+        };
+        let target = {
+            let text = state.active();
+            let caret = snap_boundary(text, state.caret());
+            if forward {
+                next_grapheme_end(text, caret)
+            } else {
+                previous_grapheme_start(text, caret)
+            }
+        };
+        state.set_caret(target);
+        cx.notify();
+    }
+
+    fn move_find_caret_home(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.find {
+            state.set_caret(0);
+            cx.notify();
+        }
+    }
+
+    fn move_find_caret_end(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.find {
+            let end = state.active().len();
+            state.set_caret(end);
+            cx.notify();
+        }
+    }
+
+    /// Recompiles after the query, regex flag, or case flag changed, then
+    /// live-highlights the first match so the query previews results as it is
+    /// typed. The view does not scroll here; `Enter` reveals the match.
+    fn after_find_query_changed(&mut self, cx: &mut Context<Self>) {
+        let from = self
+            .find
+            .as_ref()
+            .and_then(|state| state.current.map(|(start, _)| start))
+            .unwrap_or(self.document.cursor());
+        self.refresh_find(from);
+        if let Some((start, end)) = self.find.as_ref().and_then(|state| state.current) {
+            self.document.select_range(start, end);
+        }
+        cx.notify();
+    }
+
+    /// Recompiles the query and recomputes the current match at or after
+    /// `from`, wrapping to the top. Called on query changes and on open, never
+    /// per frame.
+    fn refresh_find(&mut self, from: usize) {
+        let Some((query, is_regex, case_insensitive)) = self
+            .find
+            .as_ref()
+            .map(|state| (state.find.clone(), state.regex, state.case_insensitive))
+        else {
+            return;
+        };
+
+        let compiled = find::compile(&query, is_regex, case_insensitive);
+        let (matcher, error, current) = match compiled {
+            Ok(Some(matcher)) => {
+                let text = self.document.text();
+                let from = from.min(text.len());
+                let current = find::find_next(text, &matcher, from)
+                    .or_else(|| find::find_next(text, &matcher, 0));
+                (Some(matcher), None, current)
+            }
+            Ok(None) => (None, None, None),
+            Err(message) => (None, Some(message), None),
+        };
+
+        if let Some(state) = &mut self.find {
+            state.matcher = matcher;
+            state.error = error;
+            state.current = current;
+            state.wrapped = false;
+        }
+    }
+
+    fn find_next_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_find();
+        let (next, wrapped) = {
+            let Some(state) = self.find.as_ref() else {
+                return;
+            };
+            let Some(matcher) = state.matcher.as_ref() else {
+                return;
+            };
+            let from = state
+                .current
+                .map(|(_, end)| end)
+                .unwrap_or(self.document.cursor());
+            let text = self.document.text();
+            match find::find_next(text, matcher, from) {
+                Some(range) => (Some(range), false),
+                None => (find::find_next(text, matcher, 0), true),
+            }
+        };
+
+        if let Some(state) = &mut self.find {
+            state.current = next;
+            state.wrapped = wrapped && next.is_some();
+        }
+        match next {
+            Some(range) => self.select_match(range, window, cx),
+            None => self.show_hint("No matches", cx),
+        }
+    }
+
+    fn find_prev_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_find();
+        let (previous, wrapped) = {
+            let Some(state) = self.find.as_ref() else {
+                return;
+            };
+            let Some(matcher) = state.matcher.as_ref() else {
+                return;
+            };
+            let before = state
+                .current
+                .map(|(start, _)| start)
+                .unwrap_or(self.document.cursor());
+            let text = self.document.text();
+            match find::find_prev(text, matcher, before) {
+                Some(range) => (Some(range), false),
+                None => (find::find_prev(text, matcher, text.len()), true),
+            }
+        };
+
+        if let Some(state) = &mut self.find {
+            state.current = previous;
+            state.wrapped = wrapped && previous.is_some();
+        }
+        match previous {
+            Some(range) => self.select_match(range, window, cx),
+            None => self.show_hint("No matches", cx),
+        }
+    }
+
+    /// Selects a match and, only if it is off-screen, scrolls it into view.
+    fn select_match(
+        &mut self,
+        range: (usize, usize),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.document.select_range(range.0, range.1);
+        self.caret_visible = true;
+        self.reveal_offset(range.0, window, cx);
+        window.notify_text_selection_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Scrolls only when the row containing `offset` is outside the visible
+    /// window, so stepping through nearby matches does not jerk to the top.
+    /// This uses the on-screen row range, not `visible_window` (which includes
+    /// overscan rows that are not actually painted).
+    fn reveal_offset(&self, offset: usize, window: &Window, cx: &App) {
+        let line_height = f32::from(self.metrics.line_height);
+        let viewport_height = self.editor_height(window);
+        let (row, first, last) = {
+            let layout = self.wrap_layout(cx);
+            let row = self.row_of_offset(&layout, offset, cx);
+            let total = layout.total_rows(&self.document);
+            let scroll_top = (-f32::from(self.scroll_handle.offset().y)).max(0.0);
+            let first = ((scroll_top / line_height).floor() as u32).min(total.saturating_sub(1));
+            let count = (viewport_height / line_height).ceil() as u32;
+            let last = first.saturating_add(count).min(total.saturating_sub(1));
+            (row, first, last)
+        };
+        if row < first || row > last {
+            self.set_editor_scroll_for_text_offset(offset, cx, window);
+        }
+    }
+
+    fn replace_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_find();
+        let Some(range) = self.find.as_ref().and_then(|state| state.current) else {
+            self.show_hint("No matches", cx);
+            return;
+        };
+        let replacement = {
+            let Some(state) = self.find.as_ref() else {
+                return;
+            };
+            let Some(matcher) = state.matcher.as_ref() else {
+                return;
+            };
+            find::replacement_for(self.document.text(), matcher, range, &state.replace)
+        };
+
+        if self.replace_range(range.0, range.1, &replacement, window, cx) {
+            // The match offsets are stale after the edit; re-find from the end
+            // of the inserted text, which the model parked the caret on.
+            if let Some(state) = &mut self.find {
+                state.current = None;
+            }
+            self.find_next_match(window, cx);
+        }
+    }
+
+    fn replace_all_find(
+        &mut self,
+        in_selection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.record_find();
+        let (start, end) = if in_selection {
+            let Some((start, end)) = self.find.as_ref().and_then(|state| state.selection) else {
+                self.show_hint("Select text to replace within", cx);
+                return;
+            };
+            // The snapshot can drift if earlier replacements changed the text;
+            // clamp so slicing is always valid.
+            let start = self.document.clamp_boundary(start);
+            let end = self.document.clamp_boundary(end).max(start);
+            (start, end)
+        } else {
+            (0, self.document.len())
+        };
+
+        if !self
+            .find
+            .as_ref()
+            .is_some_and(|state| state.matcher.is_some())
+        {
+            self.show_hint("No matches", cx);
+            return;
+        }
+
+        let outcome = {
+            let Some(state) = self.find.as_ref() else {
+                return;
+            };
+            let Some(matcher) = state.matcher.as_ref() else {
+                return;
+            };
+            // Cap the replacement so an expanding template is refused before
+            // the document is mutated (the model enforces the same cap).
+            let max = MAX_DOCUMENT_BYTES.saturating_sub(self.document.len() - (end - start));
+            find::replace_all(
+                &self.document.text()[start..end],
+                matcher,
+                &state.replace,
+                max,
+            )
+        };
+
+        let Some(new_text) = outcome else {
+            self.show_hint("Document limit reached (64 MB).", cx);
+            return;
+        };
+        if new_text.as_str() == &self.document.text()[start..end] {
+            self.show_hint("No matches", cx);
+            return;
+        }
+
+        if self.replace_range(start, end, &new_text, window, cx) {
+            // Keep the replaced region selected (selection mode) or park the
+            // caret at the region start (whole document).
+            if in_selection {
+                self.document.select_range(start, start + new_text.len());
+            } else {
+                self.document.set_cursor(start, false);
+            }
+            self.caret_visible = true;
+            if let Some(state) = &mut self.find {
+                state.current = None;
+                state.wrapped = false;
+                if in_selection {
+                    state.selection = Some((start, start + new_text.len()));
+                }
+            }
+            window.notify_text_selection_changed(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    /// Opens the modal for jumping to a 1-based line number.
+    fn open_jump_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.jump_prompt = Some(String::new());
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn push_jump_digits(&mut self, text: &str) {
+        if let Some(value) = &mut self.jump_prompt {
+            for ch in text.chars() {
+                if ch.is_ascii_digit() && value.len() < 9 {
+                    value.push(ch);
+                }
+            }
+        }
+    }
+
+    /// Clamps the typed line number into the document and moves the caret to
+    /// the start of that line.
+    fn apply_jump_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(value) = self.jump_prompt.take() else {
+            return;
+        };
+        window.notify_text_input_changed(&self.focus_handle);
+        let Ok(line_number) = value.parse::<usize>() else {
+            cx.notify();
+            return;
+        };
+        if line_number == 0 {
+            cx.notify();
+            return;
+        }
+        let line = (line_number - 1).min(self.document.line_count().saturating_sub(1));
+        let offset = self.document.line_range(line).0;
+        self.document.set_cursor(offset, false);
+        self.caret_visible = true;
+        self.set_editor_scroll_for_text_offset(offset, cx, window);
+        window.notify_text_selection_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// "L: x/y, C: z" for the status bar. Column counts grapheme clusters so the
+    /// number matches the caret's character position.
+    fn cursor_status_label(&self) -> String {
+        let cursor = self.document.cursor();
+        let line = self.document.line_of_offset(cursor);
+        let line_count = self.document.line_count();
+        let line_start = self.document.line_range(line).0.min(cursor);
+        let column = self.document.text()[line_start..cursor]
+            .graphemes(true)
+            .count()
+            + 1;
+        format!("L: {}/{}, C: {}", line + 1, line_count, column)
+    }
+
     /// Shows a transient status-bar message, replacing any current hint.
     fn show_hint(&mut self, hint: impl Into<String>, cx: &mut Context<Self>) {
         self.hint = Some(hint.into());
@@ -1260,13 +2186,57 @@ impl Scratchpad {
 
     /// Palette entries matching the query, best match first. Recently used
     /// transforms lead when the query is empty.
-    fn palette_matches(&self) -> Vec<usize> {
+    fn palette_matches(&self) -> Vec<PaletteEntry> {
         let query = self
             .palette
             .as_ref()
             .map(|palette| palette.query.as_str())
             .unwrap_or("");
-        transforms::search(query, &self.recent_transforms)
+
+        // Empty query: commands lead, then the transform order with recents
+        // promoted (matching `transforms::search`).
+        if query.trim().is_empty() {
+            let mut ordered: Vec<PaletteEntry> = (0..commands::COMMANDS.len())
+                .map(PaletteEntry::Command)
+                .collect();
+            ordered.extend(
+                transforms::search("", &self.recent_transforms)
+                    .into_iter()
+                    .map(PaletteEntry::Transform),
+            );
+            return ordered;
+        }
+
+        let query = query.trim().to_lowercase();
+        let mut recency: HashMap<&str, usize> = HashMap::new();
+        for (position, name) in self.recent_transforms.iter().enumerate() {
+            recency.entry(name.as_str()).or_insert(position);
+        }
+
+        let mut scored: Vec<(u32, usize, usize, PaletteEntry)> = Vec::new();
+        for (index, transform) in transforms::TRANSFORMS.iter().enumerate() {
+            if let Some(score) = transforms::match_score_parts(
+                transform.name,
+                transform.tags,
+                transform.description,
+                &query,
+            ) {
+                let rank = recency.get(transform.name).copied().unwrap_or(usize::MAX);
+                scored.push((score, rank, index, PaletteEntry::Transform(index)));
+            }
+        }
+        for (index, command) in commands::COMMANDS.iter().enumerate() {
+            if let Some(score) = transforms::match_score_parts(
+                command.name,
+                command.tags,
+                command.description,
+                &query,
+            ) {
+                scored.push((score, usize::MAX, index, PaletteEntry::Command(index)));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        scored.into_iter().map(|(_, _, _, entry)| entry).collect()
     }
 
     fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1286,8 +2256,7 @@ impl Scratchpad {
             // Bounded by `len` so an all-unavailable list never spins.
             for _ in 0..len {
                 current = (current + delta).clamp(0, len - 1);
-                let index = matches[current as usize];
-                if transforms::is_available(&transforms::TRANSFORMS[index], has_selection) {
+                if palette_entry_available(matches[current as usize], has_selection) {
                     break;
                 }
             }
@@ -1299,13 +2268,29 @@ impl Scratchpad {
         cx.notify();
     }
 
-    fn apply_selected_transform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_selected_palette_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let matches = self.palette_matches();
         if matches.is_empty() {
             return;
         }
         let selected = self.palette.as_ref().map_or(0, |palette| palette.selected);
-        let index = matches[selected.min(matches.len() - 1)];
+        let entry = matches[selected.min(matches.len() - 1)];
+
+        // Commands open UI; they close the palette and never touch the document.
+        if let PaletteEntry::Command(index) = entry {
+            let command = commands::COMMANDS[index];
+            self.palette = None;
+            window.notify_text_input_changed(&self.focus_handle);
+            match command.id {
+                commands::CommandId::OpenFind => self.open_find(window, cx),
+                commands::CommandId::OpenFindReplace => self.open_find_replace(window, cx),
+            }
+            return;
+        }
+
+        let PaletteEntry::Transform(index) = entry else {
+            return;
+        };
         let transform = transforms::TRANSFORMS[index];
 
         let (sel_start, sel_end) = self.document.selection_range();
@@ -2507,6 +3492,13 @@ impl EntityInputHandler for Scratchpad {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(state) = &self.find {
+            let text = state.active().as_str();
+            let start = byte_offset_for_utf16(text, range_utf16.start);
+            let end = byte_offset_for_utf16(text, range_utf16.end);
+            *adjusted_range = Some(utf16_offset(text, start)..utf16_offset(text, end));
+            return Some(text[start..end].to_string());
+        }
         if let Some(palette) = &self.palette {
             let query = &palette.query;
             let start = byte_offset_for_utf16(query, range_utf16.start);
@@ -2526,6 +3518,15 @@ impl EntityInputHandler for Scratchpad {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(state) = &self.find {
+            let text = state.active();
+            let caret = snap_boundary(text, state.caret());
+            let caret = utf16_offset(text, caret);
+            return Some(UTF16Selection {
+                range: caret..caret,
+                reversed: false,
+            });
+        }
         if let Some(palette) = &self.palette {
             let len = utf16_offset(&palette.query, palette.query.len());
             return Some(UTF16Selection {
@@ -2565,9 +3566,49 @@ impl EntityInputHandler for Scratchpad {
         if self.pending_transform.is_some() {
             return;
         }
+        // Route typing/paste to the jump-to-line prompt when it is open.
+        if self.jump_prompt.is_some() {
+            self.push_jump_digits(text);
+            window.notify_text_input_changed(&self.focus_handle);
+            cx.notify();
+            return;
+        }
         // Route typing to the inline byte editor when it is open.
         if self.byte_edit.is_some() {
             self.push_byte_edit(text);
+            window.notify_text_input_changed(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+        // Route typing/paste to the active find/replace field when it is open.
+        if self.find.is_some() {
+            let editing_find = {
+                let Some(state) = &mut self.find else {
+                    return;
+                };
+                let field_text = state.active();
+                let caret = snap_boundary(field_text, state.caret());
+                let (start, end) = match replacement_range {
+                    Some(range) => (
+                        byte_offset_for_utf16(field_text, range.start),
+                        byte_offset_for_utf16(field_text, range.end),
+                    ),
+                    None => (caret, caret),
+                };
+                let len = field_text.len();
+                let start = start.min(len);
+                let end = end.min(len).max(start);
+                state.active_mut().replace_range(start..end, text);
+                state.set_caret(start + text.len());
+                let editing_find = state.field == FindField::Find;
+                if editing_find {
+                    state.reset_history();
+                }
+                editing_find
+            };
+            if editing_find {
+                self.after_find_query_changed(cx);
+            }
             window.notify_text_input_changed(&self.focus_handle);
             cx.notify();
             return;
@@ -2628,7 +3669,7 @@ impl EntityInputHandler for Scratchpad {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if self.palette.is_some() {
+        if self.find.is_some() || self.palette.is_some() {
             return None;
         }
         let offset = self.document.byte_offset_for_utf16(range_utf16.end);
@@ -2641,7 +3682,7 @@ impl EntityInputHandler for Scratchpad {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if self.palette.is_some() {
+        if self.find.is_some() || self.palette.is_some() {
             return None;
         }
         let bounds = self.last_bounds.get()?;
@@ -2945,6 +3986,52 @@ impl Render for Scratchpad {
             content.w_full()
         };
 
+        // Cache the cursor label by `(revision, cursor)`: the caret blink calls
+        // `cx.notify()` twice a second, and counting the current line's graphemes
+        // on every frame would be a whole-line scan in the worst case (a 64 MB
+        // single line).
+        let cursor_status = {
+            let revision = self.document.revision();
+            let cursor = self.document.cursor();
+            let cached = match &self.cursor_status_cache {
+                Some((r, c, label)) if *r == revision && *c == cursor => Some(label.clone()),
+                _ => None,
+            };
+            match cached {
+                Some(label) => label,
+                None => {
+                    let label = self.cursor_status_label();
+                    self.cursor_status_cache = Some((revision, cursor, label.clone()));
+                    label
+                }
+            }
+        };
+
+        let selection_status = {
+            let revision = self.document.revision();
+            let (start, end) = self.document.selection_range();
+            if start == end {
+                self.selection_status_cache = None;
+                None
+            } else {
+                let cached = match &self.selection_status_cache {
+                    Some((r, s, e, label)) if *r == revision && *s == start && *e == end => {
+                        Some(label.clone())
+                    }
+                    _ => None,
+                };
+                Some(match cached {
+                    Some(label) => label,
+                    None => {
+                        let (chars, words) = self.document.selection_stats(start, end);
+                        let label = format!("S:{chars},W:{words}");
+                        self.selection_status_cache = Some((revision, start, end, label.clone()));
+                        label
+                    }
+                })
+            }
+        };
+
         let (status_message, status_color) = match &self.hint {
             Some(hint) => (hint.clone(), rgb(0xf9e2af)),
             None if self.save_failed => {
@@ -2974,6 +4061,32 @@ impl Render for Scratchpad {
                     .flex()
                     .flex_row()
                     .items_center()
+                    .children(selection_status.map(|label| {
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_size(px(12.0))
+                            // Yellow marks the selection counts, distinct from
+                            // the teal cursor label and the gray toggles.
+                            .text_color(rgb(0xf9e2af))
+                            .child(label)
+                    }))
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_size(px(12.0))
+                            // Teal distinguishes the cursor position from the
+                            // toggle items next to it.
+                            .text_color(rgb(0x94e2d5))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, window, cx| {
+                                    this.open_jump_prompt(window, cx);
+                                }),
+                            )
+                            .child(cursor_status),
+                    )
                     .child(
                         div()
                             .px(px(6.0))
@@ -3080,10 +4193,22 @@ impl Render for Scratchpad {
                         .into_any_element(),
                 );
             }
-            for (position, transform_index) in matches.iter().enumerate() {
-                let transform = &transforms::TRANSFORMS[*transform_index];
+            for (position, entry) in matches.iter().enumerate() {
+                let (name, description, available) = match *entry {
+                    PaletteEntry::Transform(index) => {
+                        let transform = &transforms::TRANSFORMS[index];
+                        (
+                            transform.name,
+                            transform.description,
+                            transforms::is_available(transform, has_selection),
+                        )
+                    }
+                    PaletteEntry::Command(index) => {
+                        let command = &commands::COMMANDS[index];
+                        (command.name, command.description, true)
+                    }
+                };
                 let selected = position == selected_index;
-                let available = transforms::is_available(transform, has_selection);
                 let name_color = if !available {
                     rgb(0x585b70)
                 } else if selected {
@@ -3091,15 +4216,14 @@ impl Render for Scratchpad {
                 } else {
                     rgb(0xa6adc8)
                 };
-                let description = transform.description;
                 let info_icon = div()
                     .child("info")
                     .text_size(px(11.0))
                     .text_color(rgb(0x6c7086))
                     .px(px(6.0))
                     .py(px(2.0))
-                    .id(("transform-info", *transform_index))
-                    // Clicking the label must not also apply the transform.
+                    .id(("palette-info", position))
+                    // Clicking the label must not also apply the entry.
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
@@ -3118,7 +4242,7 @@ impl Render for Scratchpad {
                     .px(px(8.0))
                     .py(px(4.0))
                     .text_color(name_color)
-                    .child(transform.name)
+                    .child(name)
                     .child(info_icon);
                 let item = if selected {
                     item.bg(rgb(0x313244))
@@ -3126,12 +4250,12 @@ impl Render for Scratchpad {
                     item
                 };
                 let item = item
-                    .id(("transform-row", *transform_index))
+                    .id(("palette-row", position))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         if let Some(palette) = &mut this.palette {
                             palette.selected = position;
                         }
-                        this.apply_selected_transform(window, cx);
+                        this.apply_selected_palette_entry(window, cx);
                     }));
                 items.push(item.into_any_element());
             }
@@ -3194,6 +4318,277 @@ impl Render for Scratchpad {
                                 .track_scroll(&self.palette_scroll)
                                 .children(items),
                         ),
+                )
+        });
+
+        let find_overlay = self.find.as_ref().map(|state| {
+            let field = state.field;
+            let find_display = field_display(&state.find, state.find_caret, field == FindField::Find);
+            let replace_display =
+                field_display(&state.replace, state.replace_caret, field == FindField::Replace);
+
+            let (status_text, status_color) = if let Some(error) = &state.error {
+                (format!("Invalid regex: {error}"), rgb(0xf38ba8))
+            } else if state.matcher.is_none() {
+                (String::new(), rgb(0x6c7086))
+            } else if state.current.is_none() {
+                ("No matches".to_string(), rgb(0x6c7086))
+            } else if state.wrapped {
+                ("Wrapped".to_string(), rgb(0xf9e2af))
+            } else {
+                (String::new(), rgb(0x6c7086))
+            };
+
+            let has_matcher = state.matcher.is_some();
+            // Use the snapshot, not the live selection: find navigation moves
+            // the live selection onto the current match.
+            let has_selection = state.selection.is_some();
+
+            let find_field = div()
+                .flex_1()
+                .overflow_hidden()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .bg(rgb(0x313244))
+                .text_color(rgb(0xf5e0dc))
+                .id("find-query-field")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    if let Some(state) = &mut this.find {
+                        let end = state.find.len();
+                        state.field = FindField::Find;
+                        state.find_caret = end;
+                    }
+                    window.notify_text_input_changed(&this.focus_handle);
+                    cx.notify();
+                }))
+                .child(find_display);
+
+            let replace_field = div()
+                .flex_1()
+                .overflow_hidden()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .bg(rgb(0x313244))
+                .text_color(rgb(0xf5e0dc))
+                .id("find-replace-field")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    if let Some(state) = &mut this.find {
+                        let end = state.replace.len();
+                        state.field = FindField::Replace;
+                        state.replace_caret = end;
+                    }
+                    window.notify_text_input_changed(&this.focus_handle);
+                    cx.notify();
+                }))
+                .child(replace_display);
+
+            let regex_toggle = div()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .text_size(px(12.0))
+                .text_color(if state.regex {
+                    rgb(0x11111b)
+                } else {
+                    rgb(0xa6adc8)
+                })
+                .bg(if state.regex {
+                    rgb(0x94e2d5)
+                } else {
+                    rgb(0x313244)
+                })
+                .id("find-regex-toggle")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_find_regex(cx);
+                }))
+                .child(".*");
+
+            let case_toggle = div()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .text_size(px(12.0))
+                .text_color(if state.case_insensitive {
+                    rgb(0x11111b)
+                } else {
+                    rgb(0xa6adc8)
+                })
+                .bg(if state.case_insensitive {
+                    rgb(0x94e2d5)
+                } else {
+                    rgb(0x313244)
+                })
+                .id("find-case-toggle")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_find_case_insensitive(cx);
+                }))
+                .child("Aa");
+
+            let action_color = if has_matcher {
+                rgb(0xcdd6f4)
+            } else {
+                rgb(0x585b70)
+            };
+            let selection_color = if has_matcher && has_selection {
+                rgb(0xcdd6f4)
+            } else {
+                rgb(0x585b70)
+            };
+
+            let prev_button = div()
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-prev")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.find_prev_match(window, cx);
+                }))
+                .child("Prev");
+
+            let next_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-next")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.find_next_match(window, cx);
+                }))
+                .child("Next");
+
+            let replace_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-replace-one")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.replace_current(window, cx);
+                }))
+                .child("Replace");
+
+            let replace_all_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-replace-all")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.replace_all_find(false, window, cx);
+                }))
+                .child("Replace all");
+
+            let replace_selection_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(selection_color)
+                .bg(rgb(0x313244))
+                .id("find-replace-selection")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.replace_all_find(true, window, cx);
+                }))
+                .child("All in selection");
+
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.close_find(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(560.0))
+                        .p(px(10.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(div().w(px(56.0)).text_color(rgb(0x6c7086)).child("Find"))
+                                .child(find_field)
+                                .child(regex_toggle)
+                                .child(case_toggle),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div().w(px(56.0)).text_color(rgb(0x6c7086)).child("Replace"),
+                                )
+                                .child(replace_field),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(prev_button)
+                                .child(next_button)
+                                .child(replace_button)
+                                .child(replace_all_button)
+                                .child(replace_selection_button)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .ml(px(8.0))
+                                        .text_size(px(12.0))
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                ),
+                        )
+                        .children(if self.recent_finds.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                div()
+                                    .mt(px(4.0))
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x6c7086))
+                                    .child(format!(
+                                        "Up/Down: {} recent find{}",
+                                        self.recent_finds.len(),
+                                        if self.recent_finds.len() == 1 { "" } else { "s" },
+                                    )),
+                            )
+                        }),
                 )
         });
 
@@ -3377,6 +4772,69 @@ impl Render for Scratchpad {
                                 .text_size(px(12.0))
                                 .text_color(rgb(0x6c7086))
                                 .child("Type two hex digits, Enter to apply, Esc to cancel"),
+                        ),
+                )
+        });
+
+        let jump_line_count = self.document.line_count();
+        let jump_overlay = self.jump_prompt.as_ref().map(|value| {
+            let shown = if value.is_empty() {
+                "_".to_string()
+            } else {
+                format!("{value}\u{258F}")
+            };
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                // Block the editor behind the modal, like the palette.
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        // Clicking the backdrop cancels, like Esc.
+                        this.jump_prompt = None;
+                        window.notify_text_input_changed(&this.focus_handle);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(320.0))
+                        .p(px(12.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        // Keep clicks on the dialog from cancelling.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(div().text_color(rgb(0xf5e0dc)).child("Jump to line"))
+                        .child(
+                            div()
+                                .mt(px(8.0))
+                                .text_color(rgb(0xcdd6f4))
+                                .child(shown),
+                        )
+                        .child(
+                            div()
+                                .mt(px(8.0))
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x6c7086))
+                                .child(format!(
+                                    "1-{jump_line_count}. Enter to jump, Esc to cancel"
+                                )),
                         ),
                 )
         });
@@ -3580,8 +5038,10 @@ impl Render for Scratchpad {
             .child(content_row)
             .child(status_bar)
             .children(palette_overlay)
+            .children(find_overlay)
             .children(encoding_overlay)
             .children(byte_edit_overlay)
+            .children(jump_overlay)
             .children(pending_overlay)
     }
 }

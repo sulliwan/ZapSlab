@@ -13,7 +13,7 @@ use super::{Scope, Transform, TransformResult};
 
 pub const TRANSFORMS: &[Transform] = &[Transform {
     name: "Eval Javascript",
-    description: "Runs your text as Javascript Code.",
+    description: "Evaluate a numeric expression (+ - * / %, parentheses, unary signs) and append a // Result: block; identifiers, calls, and literals are rejected.",
     tags: "js,script,run",
     scope: Scope::SelectionOrFullText,
     apply: eval_script,

@@ -1,4 +1,4 @@
-# Builder image for Zapslab.
+# Builder image for ZapSlab.
 #
 # Pinned Rust stable + wasm32 target + wasm-bindgen CLI (must match the
 # wasm-bindgen pin in Cargo.toml) + binaryen for wasm-opt.

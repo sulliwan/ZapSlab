@@ -11,42 +11,42 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Sort lines",
-        description: "Sort lines alphabetically.",
+        description: "Sort lines by Unicode code point; a single trailing newline is dropped and an already-sorted input is reversed.",
         tags: "sort,alphabet",
         scope: Scope::SelectionOrFullText,
         apply: sort_lines,
     },
     Transform {
         name: "Natural Sort Lines",
-        description: "Sort lines with smart handling of numbers.",
+        description: "Sort lines with digit runs compared numerically; a single trailing newline is dropped and an already-sorted input is reversed.",
         tags: "sort,natural,natsort",
         scope: Scope::SelectionOrFullText,
         apply: natural_sort_lines,
     },
     Transform {
         name: "Reverse Lines",
-        description: "Flips every line of your text.",
+        description: "Reverse the order of the lines.",
         tags: "reverse,order,invert,mirror,flip,upside,down",
         scope: Scope::SelectionOrFullText,
         apply: reverse_lines,
     },
     Transform {
         name: "Shuffle Lines",
-        description: "Randomize each line of your text.",
+        description: "Randomly shuffle the order of the lines.",
         tags: "shuffle,random",
         scope: Scope::SelectionOrFullText,
         apply: shuffle_lines,
     },
     Transform {
         name: "Remove Duplicate Lines",
-        description: "Ensures each line of your text is unique.",
+        description: "Remove duplicate lines, keeping the first occurrence, and report how many were removed.",
         tags: "unique,duplicate",
         scope: Scope::SelectionOrFullText,
         apply: remove_duplicate_lines,
     },
     Transform {
         name: "Collapse lines",
-        description: "Removes all linebreaks from your text",
+        description: "Join all lines with commas and report the count; always operates on the whole document, ignoring any selection.",
         tags: "strip,remove,collapse,join",
         // Boop writes this transform back to `state.fullText`, so it always
         // collapses the whole document even when a selection exists.
@@ -55,7 +55,7 @@ pub const TRANSFORMS: &[Transform] = &[
     },
     Transform {
         name: "Markdown Quote",
-        description: "Adds > to the start of every line of your text.",
+        description: "Prefix every line with '> ' to create a Markdown block quote.",
         tags: "quote,markdown",
         scope: Scope::SelectionOrFullText,
         apply: markdown_quote,

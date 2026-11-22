@@ -11,7 +11,7 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "ASCII To Hex",
-        description: "Converts ASCII characters to hexadecimal codes.",
+        description: "Convert each UTF-16 code unit to uppercase hex; astral characters become a surrogate pair. Operates on the whole document.",
         tags: "ascii,hex,convert",
         // The script scans `state.fullText`, so it ignores any selection.
         scope: Scope::FullText,
@@ -19,42 +19,42 @@ pub const TRANSFORMS: &[Transform] = &[
     },
     Transform {
         name: "Hex To ASCII",
-        description: "Converts hexadecimal values into ASCII characters",
+        description: "Interpret hex digit pairs as byte values (U+0000-U+00FF); whitespace is ignored, a dangling digit is dropped, and non-hex input is an error. Operates on the whole document.",
         tags: "hex,ascii,convert",
         scope: Scope::FullText,
         apply: hex_to_ascii,
     },
     Transform {
         name: "Binary to Decimal",
-        description: "Converts binary values to decimal.",
+        description: "Convert each line from binary to decimal; lines that do not parse are left unchanged.",
         tags: "decimal,binary,dec,bin",
         scope: Scope::SelectionOrFullText,
         apply: binary_to_decimal,
     },
     Transform {
         name: "Decimal to Binary",
-        description: "Converts decimal values to binary.",
+        description: "Convert each line from decimal to binary; lines that do not parse are left unchanged.",
         tags: "decimal,binary,dec,bin",
         scope: Scope::SelectionOrFullText,
         apply: decimal_to_binary,
     },
     Transform {
         name: "Decimal to Hex",
-        description: "Converts decimal values to hexadecimal.",
+        description: "Convert each line from decimal to hexadecimal; lines that are not numbers are left unchanged.",
         tags: "decimal,hexadecimal,dec,hex",
         scope: Scope::SelectionOrFullText,
         apply: decimal_to_hex,
     },
     Transform {
         name: "Hex to Dec",
-        description: "Converts hexadecimal to decimal.",
+        description: "Convert each line from hexadecimal to decimal; lines that do not parse are left unchanged.",
         tags: "decimal,hexadecimal,dec,hex",
         scope: Scope::SelectionOrFullText,
         apply: hex_to_decimal,
     },
     Transform {
         name: "Sum All",
-        description: "Sums up a list of numbers.",
+        description: "Parse numbers from all tokens, then append per-line annotations and a final '= total'; zero and non-numeric tokens are ignored.",
         tags: "sum,calculator,addition,add",
         scope: Scope::SelectionOrFullText,
         apply: sum_all,

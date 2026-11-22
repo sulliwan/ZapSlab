@@ -1,8 +1,8 @@
-# Zapslab
+# ZapSlab
 
 ## What is this?
 
-It's a scratchpad similar to [Boop](https://github.com/IvanMathy/Boop), but running as a WASM web app to make it available for all platforms. We are using [GPUI](https://gpui.rs/) as our UI framework. The app is entirely self-contained and can be hosted as a static site. Scratchpad contents are persisted to localstorage. Nothing gets uploaded to any server.
+It's a scratchpad similar to [Boop](https://github.com/IvanMathy/Boop), but running as a WASM web app to make it available for all platforms. We are using [GPUI](https://gpui.rs/) as our UI framework. The app is entirely self-contained and can be hosted as a static site. Scratchpad contents are persisted to IndexedDB. Nothing gets uploaded to any server.
 
 ## How do I use this?
 

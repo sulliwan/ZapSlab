@@ -1,4 +1,4 @@
-# Zapslab — containerized builds.
+# ZapSlab — containerized builds.
 #
 # Every cargo/rust invocation runs inside a pinned builder image, so the host
 # only needs a container runtime (nerdctl / docker / podman) and make.
@@ -33,7 +33,7 @@ RUN = $(RUNTIME) run --rm \
 .PHONY: help image check test wasm web icons serve shell vendor-wgpu clean
 
 help:
-	@echo "Zapslab targets:"
+	@echo "ZapSlab targets:"
 	@echo "  image  build the builder image ($(IMAGE) from $(RUST_IMAGE))"
 	@echo "  check  cargo check for wasm32-unknown-unknown (fast feedback)"
 	@echo "  test   unit tests for the pure document model (no wasm/gpui deps)"

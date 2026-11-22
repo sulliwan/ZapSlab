@@ -5,28 +5,28 @@ use unicode_segmentation::UnicodeSegmentation;
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Reverse String",
-        description: "!seod ti tahw sseuG",
+        description: "Reverse the text by grapheme clusters so combining marks and emoji stay intact.",
         tags: "flip,mirror,invert",
         scope: Scope::SelectionOrFullText,
         apply: reverse_string,
     },
     Transform {
         name: "Rot13",
-        description: "Applies the Rot13 cypher to your text.",
+        description: "Apply ROT13 to ASCII letters; other characters are unchanged.",
         tags: "spoilers,encryption,plaintext",
         scope: Scope::SelectionOrFullText,
         apply: rot13,
     },
     Transform {
         name: "Trim",
-        description: "Trims leading and trailing whitespace.",
+        description: "Remove leading and trailing whitespace.",
         tags: "trim,whitespace,empty,space",
         scope: Scope::SelectionOrFullText,
         apply: trim,
     },
     Transform {
         name: "Lorem Ipsum",
-        description: "Generates Lorem Ipsum placeholder text.",
+        description: "Replace the target with 100 randomly chosen Lorem Ipsum words.",
         tags: "generate,lorem,ipsum,text",
         scope: Scope::SelectionOrFullText,
         apply: lorem_ipsum,

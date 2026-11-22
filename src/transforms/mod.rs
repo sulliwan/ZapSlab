@@ -143,11 +143,18 @@ pub fn is_expensive(transform: &Transform) -> bool {
     )
 }
 
-/// Relevance of `transform` for a lowercased `query`, or `None` if it does not
-/// match. Name matches always outrank tag/description matches.
-fn match_score(transform: &Transform, query: &str) -> Option<u32> {
-    let name = transform.name.to_lowercase();
-    let tags = transform.tags.to_lowercase();
+/// Relevance of a palette entry (a transform or a command) for a lowercased
+/// `query`, or `None` if it does not match. Name matches always outrank
+/// tag/description matches. Shared with [`crate::commands`] so commands rank
+/// against transforms using the same rules.
+pub(crate) fn match_score_parts(
+    name: &str,
+    tags: &str,
+    description: &str,
+    query: &str,
+) -> Option<u32> {
+    let name = name.to_lowercase();
+    let tags = tags.to_lowercase();
     if name == query {
         Some(100)
     } else if name.starts_with(query) {
@@ -160,11 +167,22 @@ fn match_score(transform: &Transform, query: &str) -> Option<u32> {
         Some(30)
     } else if tags.contains(query) {
         Some(20)
-    } else if transform.description.to_lowercase().contains(query) {
+    } else if description.to_lowercase().contains(query) {
         Some(10)
     } else {
         None
     }
+}
+
+/// Relevance of `transform` for a lowercased `query`, or `None` if it does not
+/// match. Name matches always outrank tag/description matches.
+fn match_score(transform: &Transform, query: &str) -> Option<u32> {
+    match_score_parts(
+        transform.name,
+        transform.tags,
+        transform.description,
+        query,
+    )
 }
 
 /// Palette ordering for `query`: best match first.

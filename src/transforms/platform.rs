@@ -8,14 +8,14 @@ use super::{Scope, Transform, TransformResult};
 pub const TRANSFORMS: &[Transform] = &[
     Transform {
         name: "Android Strings to iOS Localizables",
-        description: "Converts Android Strings to iOS localizables.",
+        description: "Convert Android <string name=\"k\">v</string> lines to \"k\" = \"v\"; only the first '>' on each line is rewritten.",
         tags: "string,android,ios",
         scope: Scope::FullText,
         apply: android_to_ios,
     },
     Transform {
         name: "iOS Localizables to Android Strings",
-        description: "Converts iOS Localizables to Android Strings",
+        description: "Convert \"k\" = \"v\"; lines to <string> entries; empty lines are dropped and missing quoted values become undefined.",
         tags: "string,android,ios",
         scope: Scope::FullText,
         apply: ios_to_android,
