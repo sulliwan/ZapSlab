@@ -204,6 +204,50 @@ impl HexIndex {
         }
         None
     }
+
+    /// Encoded byte offset of the grapheme that starts at (or contains)
+    /// `text_offset`.
+    ///
+    /// This is the inverse of [`Self::text_range_at`]. Offsets inside a grapheme
+    /// snap to its start, so the two directions always agree and callers never
+    /// land mid-codepoint. The scan starts from the nearest checkpoint, keeping
+    /// it local rather than whole-buffer.
+    pub fn encoded_offset_at_text(&self, text: &str, text_offset: usize) -> usize {
+        let text_offset = text_offset.min(text.len());
+        if text_offset == 0 {
+            return 0;
+        }
+        // Checkpoints record the text offset just past a grapheme, so the last
+        // one at or before the target begins the local scan.
+        let index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.text <= text_offset);
+        // `checkpoints[0].text == 0 <= text_offset`, so `index >= 1`.
+        let checkpoint = self.checkpoints[index - 1];
+        let mut encoded = checkpoint.encoded;
+        for (relative_start, relative_end) in grapheme_ranges(&text[checkpoint.text..]) {
+            let start = checkpoint.text + relative_start;
+            let end = checkpoint.text + relative_end;
+            if text_offset < end {
+                return encoded;
+            }
+            // The index only exists for encodable text; treat a failure as the
+            // end of what can be represented rather than panicking.
+            let Ok(length) = encoding::encoded_len(&text[start..end], self.encoding) else {
+                return encoded;
+            };
+            encoded += length;
+        }
+        encoded
+    }
+
+    /// Row whose encoded byte window contains the grapheme at `text_offset`.
+    ///
+    /// Clamped to the last row so the end-of-buffer offset stays in range.
+    pub fn row_of_text_offset(&self, text: &str, text_offset: usize) -> usize {
+        let row = self.encoded_offset_at_text(text, text_offset) / self.bytes_per_row;
+        row.min(self.row_count() - 1)
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +412,80 @@ mod tests {
                 assert_eq!(cell.text_range, 0..3);
             }
         }
+    }
+
+    #[test]
+    fn text_offset_maps_back_to_its_grapheme() {
+        for text in [
+            "",
+            "hello",
+            "line one\nline two\n",
+            "a😀b",
+            "héllo",
+            "e\u{301}x",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+        ] {
+            for encoding in [
+                Encoding::Utf8,
+                Encoding::Utf16Le,
+                Encoding::Utf16Be,
+                Encoding::Utf32Le,
+                Encoding::Utf32Be,
+                Encoding::Latin1,
+            ] {
+                if encoding == Encoding::Latin1 && text.chars().any(|ch| ch as u32 > 0xFF) {
+                    continue;
+                }
+                for bytes_per_row in [1usize, 3, 4, 16] {
+                    let index = HexIndex::build(text, encoding, bytes_per_row).unwrap();
+
+                    let mut boundaries: Vec<usize> =
+                        grapheme_ranges(text).map(|(start, _)| start).collect();
+                    boundaries.push(text.len());
+
+                    for &boundary in &boundaries {
+                        let encoded = index.encoded_offset_at_text(text, boundary);
+                        assert!(encoded <= index.encoded_len());
+                        if boundary < text.len() {
+                            let range = index
+                                .text_range_at(text, encoded)
+                                .expect("encoded offset inside the buffer");
+                            assert_eq!(range.start, boundary, "{text:?} at {boundary}");
+                        } else {
+                            assert_eq!(encoded, index.encoded_len());
+                        }
+
+                        let row = index.row_of_text_offset(text, boundary);
+                        assert!(row < index.row_count(), "{text:?} at {boundary}");
+                        // The row never starts after the grapheme it contains.
+                        assert!(row * bytes_per_row <= encoded);
+                    }
+
+                    // Offsets inside a grapheme snap to its start.
+                    for (start, end) in grapheme_ranges(text) {
+                        let expected = index.encoded_offset_at_text(text, start);
+                        for inside in (start + 1)..end {
+                            assert_eq!(
+                                index.encoded_offset_at_text(text, inside),
+                                expected,
+                                "{text:?} inside {start}..{end}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_of_text_offset_clamps_the_end_of_buffer() {
+        // Four UTF-8 bytes over two-byte rows: the end offset must not report a
+        // phantom row past the last one.
+        let text = "abcd";
+        let index = HexIndex::build(text, Encoding::Utf8, 2).unwrap();
+        assert_eq!(index.row_count(), 2);
+        assert_eq!(index.row_of_text_offset(text, text.len()), 1);
+        assert_eq!(index.row_of_text_offset(text, 0), 0);
     }
 
     #[test]

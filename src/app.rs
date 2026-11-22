@@ -77,6 +77,11 @@ const OVERSCAN_ROWS: u32 = 24;
 /// frame (identity row mapping) and the per-line wrap index stays small.
 const WRAP_DISABLE_BYTES: usize = 8 * 1024 * 1024;
 const WRAP_DISABLE_LINES: usize = 1_000_000;
+/// Scroll deltas below this are treated as layout clamping, not user scrolling,
+/// when deciding which pane drives the editor/hex sync. gpui can clamp an
+/// offset by sub-pixel amounts during layout, which would otherwise ping-pong
+/// the two panes between frames.
+const SCROLL_SYNC_EPSILON: f32 = 0.5;
 
 #[derive(Clone, Copy)]
 struct Metrics {
@@ -317,6 +322,13 @@ pub struct Scratchpad {
     scroll_drag: Option<ScrollDrag>,
     /// Active drag on the vertical scrollbar thumb.
     v_scroll_drag: Option<ScrollDrag>,
+    /// Last settled vertical offsets, used to detect which pane the user
+    /// scrolled so the other can follow (see `sync_scroll_offsets`).
+    last_editor_scroll_y: f32,
+    last_hex_scroll_y: f32,
+    /// Set when the hex pane is toggled on so the next render aligns it to the
+    /// editor's first visible line instead of its stale offset.
+    pending_hex_snap: bool,
     content_width: Cell<f32>,
     /// Full scrollable content height (pixels), refreshed each render so the
     /// vertical scrollbar's drag math matches the painted extent.
@@ -397,6 +409,9 @@ impl Scratchpad {
             scroll_handle: ScrollHandle::default(),
             scroll_drag: None,
             v_scroll_drag: None,
+            last_editor_scroll_y: 0.0,
+            last_hex_scroll_y: 0.0,
+            pending_hex_snap: false,
             content_width: Cell::new(0.0),
             content_height: Cell::new(0.0),
             content_max_width: Cell::new(0.0),
@@ -413,6 +428,13 @@ impl Scratchpad {
                     view.document = Document::new(text.unwrap_or_default());
                     view.word_wrap = !view.document_is_large();
                     view.content_width_dirty.set(true);
+                    // The replacement document starts at revision 0, colliding with
+                    // the empty boot document's revision. Clear the revision-keyed
+                    // caches so they rebuild instead of reusing layout computed for
+                    // the empty buffer (which would show only the first line).
+                    *view.wrap_layout.borrow_mut() = None;
+                    view.hex_index = None;
+                    view.hex_index_key = None;
                     view.caret_visible = true;
                     cx.notify();
                 });
@@ -1878,6 +1900,105 @@ impl Scratchpad {
         Some((content_height, viewport_height, overflow))
     }
 
+    /// Text byte offset at the top of the editor viewport: the start of the
+    /// first visible visual row (a line start, or a wrapped chunk start when
+    /// wrap is on). `None` only when the document has no rows.
+    fn editor_top_offset(&self, viewport_height: f32, cx: &App) -> Option<usize> {
+        let layout = self.wrap_layout(cx);
+        if layout.total_rows(&self.document) == 0 {
+            return None;
+        }
+        let (first, _) = self.visible_window(&layout, viewport_height);
+        let (_, start, _) = self.row_at(&layout, cx, first);
+        Some(start)
+    }
+
+    /// Text byte offset at the top of the hex viewport: the first byte of the
+    /// first visible row, snapped to its grapheme start.
+    fn hex_top_offset(&self) -> Option<usize> {
+        let index = self.hex_index.as_ref()?;
+        if index.encoded_len() == 0 {
+            return Some(0);
+        }
+        let line_height = f32::from(self.hex_line_height.get());
+        let scroll_top = (-f32::from(self.hex_scroll.offset().y)).max(0.0);
+        let row = ((scroll_top / line_height).floor() as usize).min(index.row_count() - 1);
+        index
+            .text_range_at(self.document.text(), row * index.bytes_per_row())
+            .map(|range| range.start)
+    }
+
+    /// Scroll the hex pane so the row containing `text_offset` is first.
+    fn set_hex_scroll_for_text_offset(&self, text_offset: usize, window: &Window) {
+        let Some(index) = self.hex_index.as_ref() else {
+            return;
+        };
+        let Some((_, _, overflow)) = self.hex_scroll_geometry(window) else {
+            return;
+        };
+        let line_height = f32::from(self.hex_line_height.get());
+        let row = index.row_of_text_offset(self.document.text(), text_offset);
+        let scroll_top = (row as f32 * line_height).clamp(0.0, overflow);
+        let offset = self.hex_scroll.offset();
+        self.hex_scroll.set_offset(point(offset.x, px(-scroll_top)));
+    }
+
+    /// Scroll the editor so the visual row containing `text_offset` is first.
+    fn set_editor_scroll_for_text_offset(&self, text_offset: usize, cx: &App, window: &Window) {
+        let line_height = f32::from(self.metrics.line_height);
+        let (row, total_rows) = {
+            let layout = self.wrap_layout(cx);
+            (
+                self.row_of_offset(&layout, text_offset, cx),
+                layout.total_rows(&self.document),
+            )
+        };
+        // Derive the extent here rather than reading the cached `content_height`,
+        // which is only refreshed later in the frame.
+        let content_height = total_rows as f32 * line_height + 2.0 * PAD;
+        let overflow = (content_height - self.editor_height(window)).max(0.0);
+        let scroll_top = (row as f32 * line_height).clamp(0.0, overflow);
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle
+            .set_offset(point(offset.x, px(-scroll_top)));
+    }
+
+    /// Keep the editor and hex pane showing the same region.
+    ///
+    /// `ScrollHandle` has no change notification, so this polls once per render:
+    /// whichever handle moved since the last frame drives the other, anchored on
+    /// the first visible text byte. gpui notifies the view when an overflow
+    /// container scrolls, so a render always follows a scroll. Programmatic
+    /// sets update `last_*` too, which is what stops a two-way feedback loop.
+    fn sync_scroll_offsets(&mut self, window: &Window, cx: &App) {
+        let editor_y = f32::from(self.scroll_handle.offset().y);
+        let hex_y = f32::from(self.hex_scroll.offset().y);
+        if !self.hex_panel || self.hex_index.is_none() {
+            self.last_editor_scroll_y = editor_y;
+            self.last_hex_scroll_y = hex_y;
+            return;
+        }
+
+        if (editor_y - self.last_editor_scroll_y).abs() > SCROLL_SYNC_EPSILON {
+            self.last_editor_scroll_y = editor_y;
+            let viewport_height = f32::from(window.viewport_size().height);
+            if let Some(top) = self.editor_top_offset(viewport_height, cx) {
+                self.set_hex_scroll_for_text_offset(top, window);
+            }
+            self.last_hex_scroll_y = f32::from(self.hex_scroll.offset().y);
+        } else if (hex_y - self.last_hex_scroll_y).abs() > SCROLL_SYNC_EPSILON {
+            self.last_hex_scroll_y = hex_y;
+            if let Some(top) = self.hex_top_offset() {
+                self.set_editor_scroll_for_text_offset(top, cx, window);
+            }
+            self.last_editor_scroll_y = f32::from(self.scroll_handle.offset().y);
+        }
+        // Sub-epsilon deltas are left pending rather than re-baselined, so slow
+        // trackpad steps accumulate until both panes move. Layout clamping is
+        // bounded and never grows the delta further, so it cannot trigger a
+        // false sync on its own.
+    }
+
     fn update_hex_v_drag(
         &mut self,
         position_y: f32,
@@ -2547,6 +2668,7 @@ impl Render for Scratchpad {
 
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
+        let viewport_height = f32::from(viewport.height);
         let panel_width = if self.hex_panel {
             self.hex_panel_width_px(viewport_width)
         } else {
@@ -2582,26 +2704,11 @@ impl Render for Scratchpad {
         };
         self.content_width.set(content_width.unwrap_or(0.0));
 
-        // Only the rows in (and just around) the viewport are materialized. The
-        // wrap index is cached against the document revision and wrap settings,
-        // so per-frame work is O(visible), not O(document).
-        let viewport_height = f32::from(viewport.height);
-        let layout = self.wrap_layout(cx);
-        let total_rows = layout.total_rows(&self.document);
-        let (first_visible, last_visible) = self.visible_window(&layout, viewport_height);
-        let total_height = total_rows as f32 * line_height + 2.0 * PAD;
-        let top_spacer = first_visible as f32 * line_height;
-        let bottom_spacer =
-            total_rows.saturating_sub(last_visible).saturating_sub(1) as f32 * line_height;
-        let visible_row_ranges = self.visible_row_ranges(&layout, first_visible, last_visible, cx);
-        drop(layout);
-        // The vertical scrollbar's drag math reads the painted extent back.
-        self.content_height.set(total_height);
-
         // The row length is derived from the panel width so the bytes fill the
         // pane. The virtualized index is rebuilt only when the document revision,
         // encoding, or row width changes (not every frame), and hit-testing reads
-        // the same index.
+        // the same index. It must exist before the scroll sync below, which maps
+        // text offsets to hex rows.
         let hex_bytes = if self.hex_panel {
             hex_bytes_per_row(panel_width, &self.hex_metrics(cx))
         } else {
@@ -2620,6 +2727,34 @@ impl Render for Scratchpad {
             self.hex_index = None;
             self.hex_index_key = None;
         }
+
+        // Opening the pane aligns it to the editor's first visible line; after
+        // that, scrolling either pane moves the other. Runs before layout so the
+        // offsets painted this frame are the ones chosen here.
+        if std::mem::take(&mut self.pending_hex_snap) {
+            if let Some(top) = self.editor_top_offset(viewport_height, cx) {
+                self.set_hex_scroll_for_text_offset(top, window);
+            }
+            self.last_editor_scroll_y = f32::from(self.scroll_handle.offset().y);
+            self.last_hex_scroll_y = f32::from(self.hex_scroll.offset().y);
+        } else {
+            self.sync_scroll_offsets(window, cx);
+        }
+
+        // Only the rows in (and just around) the viewport are materialized. The
+        // wrap index is cached against the document revision and wrap settings,
+        // so per-frame work is O(visible), not O(document).
+        let layout = self.wrap_layout(cx);
+        let total_rows = layout.total_rows(&self.document);
+        let (first_visible, last_visible) = self.visible_window(&layout, viewport_height);
+        let total_height = total_rows as f32 * line_height + 2.0 * PAD;
+        let top_spacer = first_visible as f32 * line_height;
+        let bottom_spacer =
+            total_rows.saturating_sub(last_visible).saturating_sub(1) as f32 * line_height;
+        let visible_row_ranges = self.visible_row_ranges(&layout, first_visible, last_visible, cx);
+        drop(layout);
+        // The vertical scrollbar's drag math reads the painted extent back.
+        self.content_height.set(total_height);
 
         // Shape each visible row as a single text element (see `row_element` for
         // why a single `StyledText` keeps the overlay geometry exact). Only the
@@ -2901,7 +3036,12 @@ impl Render for Scratchpad {
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
                                     this.hex_panel = !this.hex_panel;
-                                    if !this.hex_panel {
+                                    if this.hex_panel {
+                                        // Align the pane to the editor on the
+                                        // next render (the hex index is built
+                                        // there).
+                                        this.pending_hex_snap = true;
+                                    } else {
                                         this.hex_drag = None;
                                         this.hex_dragging = false;
                                     }

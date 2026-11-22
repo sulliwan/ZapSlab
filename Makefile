@@ -39,7 +39,7 @@ help:
 	@echo "  test   unit tests for the pure document model (no wasm/gpui deps)"
 	@echo "  wasm   release wasm build (no packaging)"
 	@echo "  web    full pipeline: wasm + wasm-bindgen + web assets -> dist/"
-	@echo "  icons  regenerate placeholder PWA icons (host python3)"
+	@echo "  icons  render PWA icons from scripts/zapslab-icon-64.png (host python3 + pillow)"
 	@echo "  serve  serve dist/ on http://localhost:8119 (host python3)"
 	@echo "  shell  interactive shell inside the builder image"
 	@echo "  vendor-wgpu  materialize the patched wgpu source (Firefox/WebGL2 fix)"

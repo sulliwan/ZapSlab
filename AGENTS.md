@@ -34,6 +34,7 @@ crates/document/     standalone crate `zapslab-document` (pure model + tests)
   escape.rs          invisible-character escaping
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
+                     + zapslab-icon-64.png (icon source artwork)
 docker/Dockerfile    pinned builder image (Rust + wasm32 + wasm-bindgen + binaryen)
 Makefile             containerized entry points for every cargo/rust command
 dist/                generated web output (gitignored)
@@ -59,7 +60,7 @@ make wasm        # release wasm build
 make web         # wasm + wasm-bindgen + assets -> dist/
 make serve       # build and serve dist/ at http://localhost:8119
 make shell       # interactive shell in the builder image
-make icons       # regenerate placeholder PWA icons (host python3)
+make icons       # render PWA icons from the source artwork (host python3 + pillow)
 make vendor-wgpu # materialize the patched wgpu source
 make clean       # remove target/, dist/, .cache/
 ```
@@ -167,6 +168,14 @@ Rules:
   owns its own scroll handle (`hex_scroll`) and a **custom vertical scrollbar**
   with drag support, mirroring the editor's geometry helpers
   (`hex_scroll_geometry`, `begin_hex_v_drag`, `update_hex_v_drag`);
+- **scroll sync**: the editor and hex pane stay aligned on the first visible
+  text byte. `sync_scroll_offsets` polls both `ScrollHandle`s once per render
+  (gpui notifies the view when an overflow container scrolls), maps text→hex
+  with `HexIndex::encoded_offset_at_text` / `row_of_text_offset` and hex→text
+  with `text_range_at` / `row_of_offset`, then clamps the target to its valid
+  scroll range. `last_editor_scroll_y` / `last_hex_scroll_y` and
+  `SCROLL_SYNC_EPSILON` prevent a two-way loop; `pending_hex_snap` aligns the
+  pane when it is opened. Horizontal scroll and panel resizes are not synced;
 - async work (caret blink, IndexedDB load/save) and any debouncing timers;
 - presentation-only state (palette UI, scroll handles, drag state).
 
