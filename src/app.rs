@@ -3,11 +3,10 @@
 //! Design notes (M1):
 //! - Text model is a flat `String` plus cursor/anchor byte offsets and a
 //!   snapshot undo stack. Fine for scratchpad-sized documents.
-//! - Rendering uses one `div` per line with the `MONO_FONT_FAMILY` monospace
-//!   font (Iosevka Slab, embedded in the binary); caret and selection are
-//!   painted in a `canvas` overlay using glyph advances from the text system,
-//!   so geometry stays consistent with the rendered text without needing a
-//!   full text-layout pipeline.
+//! - Rendering uses one `div` per line with the monospace `.ZedMono` font;
+//!   caret and selection are painted in a `canvas` overlay using glyph
+//!   advances from the text system, so geometry stays consistent with the
+//!   rendered text without needing a full text-layout pipeline.
 //! - Input arrives two ways on web: printable characters are routed by the
 //!   platform through `EntityInputHandler::replace_text_in_range` (this is
 //!   also the paste and IME path), while editing commands (arrows, backspace,
@@ -30,12 +29,6 @@ use gpui::{
 };
 
 use crate::{storage, transforms};
-
-/// Default monospace family. Registered from the embedded Iosevka Slab font in
-/// `src/main.rs`; named explicitly because GPUI's `.ZedMono` virtual name maps
-/// to Lilex, which this build does not ship. Glyphs missing from Iosevka still
-/// fall back through the text system's normal font stack.
-const MONO_FONT_FAMILY: &str = "Iosevka Slab";
 
 const FONT_SIZE: f32 = 16.0;
 /// Smaller monospace size for the dense hex dump.
@@ -208,7 +201,7 @@ impl Scratchpad {
         let document = Document::new(storage::load().unwrap_or_default());
 
         let text_system = cx.text_system();
-        let font_id = text_system.resolve_font(&font(MONO_FONT_FAMILY));
+        let font_id = text_system.resolve_font(&font(".ZedMono"));
         let ascii_width = text_system
             .ch_advance(font_id, px(FONT_SIZE))
             .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX));
@@ -1394,7 +1387,7 @@ impl Scratchpad {
                     .p(px(PAD))
                     .flex()
                     .flex_col()
-                    .font(font(MONO_FONT_FAMILY))
+                    .font(font(".ZedMono"))
                     .text_size(px(HEX_FONT_SIZE))
                     .line_height(px(line_height))
                     .text_color(rgb(0xa6adc8))
@@ -2253,7 +2246,7 @@ impl Render for Scratchpad {
                         .child(
                             div()
                                 .p(px(PAD))
-                                .font(font(MONO_FONT_FAMILY))
+                                .font(font(".ZedMono"))
                                 .text_size(px(FONT_SIZE))
                                 .line_height(px(line_height))
                                 .text_color(rgb(0xcdd6f4))
