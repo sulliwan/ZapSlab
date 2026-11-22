@@ -11,6 +11,8 @@
   <link rel="icon" href="/icons/icon-192.png" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <meta name="mobile-web-app-capable" content="yes" />
+  <!-- Build id of the app currently loaded; injected by scripts/build_web.sh. -->
+  <meta name="zapslab-build" content="__BUILD_ID__" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <style>
@@ -45,8 +47,44 @@
     // browser's normal context menu still opens.
     window.addEventListener("contextmenu", (event) => event.stopPropagation(), true);
 
+    // Every deploy publishes the wasm content hash in /version.json. Compare it
+    // with the id this page booted with whenever the app regains focus or
+    // visibility, and hand a mismatch to the wasm app, which offers a confirmed
+    // reload. Re-posting is harmless: the app just keeps its "update available"
+    // state set.
+    const pageBuild = document.querySelector('meta[name="zapslab-build"]')?.content;
+    async function checkForUpdate() {
+      if (!pageBuild) return;
+      try {
+        const res = await fetch("/version.json", { cache: "no-store" });
+        if (!res.ok) return;
+        const info = await res.json();
+        if (info && info.build && info.build !== pageBuild) {
+          window.postMessage(
+            {
+              type: "zapslab-update-available",
+              version: info.version ?? null,
+              build: info.build,
+            },
+            location.origin
+          );
+        }
+      } catch (_) {
+        // Offline or version.json missing: retry on the next focus.
+      }
+    }
+    window.addEventListener("focus", checkForUpdate);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) checkForUpdate();
+    });
+
     init()
-      .then(() => document.getElementById("loading")?.remove())
+      .then(() => {
+        document.getElementById("loading")?.remove();
+        // The message listener is registered while the view is constructed, so
+        // the first check can run once the app has started.
+        checkForUpdate();
+      })
       .catch((err) => {
         const el = document.getElementById("loading");
         if (el) el.textContent = "failed to start: " + err;

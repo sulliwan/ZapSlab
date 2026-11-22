@@ -3,6 +3,7 @@ mod commands;
 mod find;
 mod storage;
 mod transforms;
+mod version;
 
 use std::borrow::Cow;
 

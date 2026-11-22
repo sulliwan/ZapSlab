@@ -57,7 +57,7 @@ DEPLOY_RUN = $(RUNTIME) $(DEPLOY_FLAGS) $(DEPLOY_IMAGE)
 DEPLOY_TTY = $(RUNTIME) $(DEPLOY_FLAGS) -it $(DEPLOY_IMAGE)
 
 .DEFAULT_GOAL := help
-.PHONY: help image check test wasm web icons serve deploy deploy-image deploy-login shell vendor-wgpu clean
+.PHONY: help image check test wasm web icons serve deploy deploy-image deploy-login shell vendor-wgpu clean bump_version
 
 help:
 	@echo "ZapSlab targets:"
@@ -67,6 +67,7 @@ help:
 	@echo "  wasm   release wasm build (no packaging)"
 	@echo "  web    full pipeline: wasm + wasm-bindgen + web assets -> dist/"
 	@echo "  icons  render PWA icons from scripts/zapslab-icon-64.png (host python3 + pillow)"
+	@echo "  bump_version major|minor|revision  bump the app version in Cargo.toml"
 	@echo "  serve  serve dist/ on http://localhost:8119 (host python3)"
 	@echo "  deploy  build dist/ and upload it to Cloudflare Pages (PAGES_BRANCH=$(PAGES_BRANCH))"
 	@echo "  deploy-login  log in to Cloudflare (OAuth device flow) without deploying"
@@ -101,8 +102,14 @@ wasm: $(CARGO_HOME_DIR) $(HOME_DIR) vendor-wgpu
 web: $(CARGO_HOME_DIR) $(HOME_DIR) vendor-wgpu
 	$(RUN) sh scripts/build_web.sh
 
-icons:
-	python3 scripts/gen_icons.py
+# `make bump_version major` (also minor/revision) bumps the package version in
+# Cargo.toml. The part is passed positionally, so the bare `major minor revision`
+# targets below exist only to stop make treating the argument as a missing goal.
+bump_version:
+	@python3 scripts/bump_version.py $(filter major minor revision,$(MAKECMDGOALS))
+
+major minor revision:
+	@:
 
 serve: web
 	python3 -m http.server 8119 --directory dist

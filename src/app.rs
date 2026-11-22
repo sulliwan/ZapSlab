@@ -47,7 +47,7 @@ use zapslab_document::{
     utf16_offset,
 };
 
-use crate::{commands, find, storage, transforms};
+use crate::{commands, find, storage, transforms, version};
 
 mod view;
 
@@ -697,6 +697,20 @@ pub struct Scratchpad {
     find: Option<FindState>,
     /// Set when an expensive transform needs confirmation before running.
     pending_transform: Option<PendingTransform>,
+    /// A newer deployed build reported by the page's update check. `Some` shows
+    /// the "new version" button in the palette header.
+    update_available: Option<version::UpdateInfo>,
+    /// Set when the user accepts an available update, to show the reload
+    /// confirmation before navigating.
+    pending_reload: bool,
+    /// Holds the page's update-check listener so it stays alive while the view
+    /// lives (a no-op on native).
+    _update_listener: version::UpdateListener,
+    /// Reflects update notifications from the page into the view. Held so the
+    /// task is not cancelled.
+    _update_task: Option<Task<()>>,
+    /// Persists the document before reloading for a new version.
+    _reload_task: Option<Task<()>>,
     /// Scroll position of the transform list. Reset when the palette opens or
     /// the query changes; driven by the wheel/trackpad and arrow navigation.
     palette_scroll: ScrollHandle,
@@ -823,6 +837,12 @@ impl Scratchpad {
             .ch_advance(font_id, px(HEX_FONT_SIZE))
             .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX * HEX_FONT_SIZE / FONT_SIZE));
 
+        // The page detects a newer deploy on focus/visibility and posts a
+        // message; the listener forwards it here and the task mirrors it into
+        // the view so the palette can offer a reload.
+        let (update_tx, update_rx) = async_channel::unbounded();
+        let update_listener = version::listen(update_tx);
+
         Self {
             focus_handle: cx.focus_handle(),
             document,
@@ -840,6 +860,21 @@ impl Scratchpad {
             palette: None,
             find: None,
             pending_transform: None,
+            update_available: None,
+            pending_reload: false,
+            _update_listener: update_listener,
+            _update_task: Some(cx.spawn(async move |this, cx| {
+                while let Ok(info) = update_rx.recv().await {
+                    let updated = this.update(&mut *cx, |view, cx| {
+                        view.update_available = Some(info);
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            })),
+            _reload_task: None,
             palette_scroll: ScrollHandle::default(),
             recent_transforms: storage::load_recent(),
             recent_finds: storage::load_recent_finds(),
@@ -1674,6 +1709,17 @@ impl Scratchpad {
             return true;
         }
 
+        // The reload confirmation is modal: Enter reloads, Escape cancels, and
+        // typing never reaches the palette or document behind it.
+        if self.pending_reload {
+            match keystroke.key.as_str() {
+                "escape" => self.cancel_reload(window, cx),
+                "enter" => self.confirm_reload(cx),
+                _ => {}
+            }
+            return true;
+        }
+
         if self.find.is_some() {
             return self.handle_find_key_down(event, window, cx);
         }
@@ -2383,6 +2429,8 @@ impl Render for Scratchpad {
 
         let palette_overlay = self.palette_overlay(viewport, cx);
 
+        let reload_overlay = self.reload_overlay(cx);
+
         // Scroll the active field's caret into view only when the caret or text
         // changed since the last frame that did so; a manual wheel pan must not
         // be snapped back by the caret blink.
@@ -2523,6 +2571,7 @@ impl Render for Scratchpad {
             .child(content_row)
             .child(status_bar)
             .children(palette_overlay)
+            .children(reload_overlay)
             .children(find_overlay)
             .children(encoding_overlay)
             .children(line_ending_overlay)
