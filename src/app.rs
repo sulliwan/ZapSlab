@@ -96,6 +96,13 @@ const FIND_SCROLL_LINE_PX: f32 = 20.0;
 /// Width of the ellipsis patch drawn at a field edge when text is scrolled
 /// out of view on that side.
 const FIND_OVERFLOW_PATCH_WIDTH: f32 = 16.0;
+/// Padding of the find/replace dialog body; also anchors the recent-finds
+/// dropdown to the dialog's content edge.
+const FIND_DIALOG_PADDING: f32 = 10.0;
+/// Height of one row in the recent-finds dropdown.
+const FIND_HISTORY_ROW_HEIGHT: f32 = 26.0;
+/// Maximum rows shown before the recent-finds dropdown scrolls.
+const FIND_HISTORY_MAX_ROWS: usize = 8;
 /// A font-independent down chevron, so the history affordance never renders as
 /// a missing-glyph box (the embedded UI fonts do not cover U+25BE).
 const CHEVRON_DOWN_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6z" fill="#a6adc8"/></svg>"##;

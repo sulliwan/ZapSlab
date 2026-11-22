@@ -1211,13 +1211,14 @@ impl Scratchpad {
             for (index, query) in recent_finds.iter().cloned().enumerate() {
                 let item = div()
                     .w_full()
-                    .mb(px(1.0))
+                    .h(px(FIND_HISTORY_ROW_HEIGHT))
+                    .line_height(px(FIND_HISTORY_ROW_HEIGHT))
                     .px(px(8.0))
-                    .py(px(5.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xf5e0dc))
                     .bg(rgb(0x313244))
                     .truncate()
+                    .flex_shrink_0()
                     .id(("find-history-item", index))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                         this.select_find_history(index, cx);
@@ -1225,16 +1226,28 @@ impl Scratchpad {
                     .child(query);
                 history_items.push(item.into_any_element());
             }
+            // Overlay the recent-finds list below the Find field (like a
+            // `<select>` dropdown) instead of laying it out inline, which both
+            // pushes the dialog content down and lets flex shrink the rows.
             let history_list = div()
                 .id("find-history-list")
-                .mt(px(4.0))
-                // Start under the find field: label width plus the field's left
-                // inset.
-                .ml(px(FIND_LABEL_WIDTH + FIND_FIELD_PADDING))
+                // The dropdown overflows the dialog's bottom, so clicks on it
+                // must not bubble to the backdrop (which closes the dialog).
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .absolute()
+                .top(px(FIND_DIALOG_PADDING + FIND_FIELD_MIN_HEIGHT + 4.0))
+                .left(px(FIND_DIALOG_PADDING
+                    + FIND_LABEL_WIDTH
+                    + FIND_FIELD_PADDING))
+                .right(px(FIND_DIALOG_PADDING))
                 .bg(rgb(0x181825))
                 .flex()
                 .flex_col()
-                .max_h(px(240.0))
+                .min_h(px(0.0))
+                .max_h(px(FIND_HISTORY_ROW_HEIGHT * FIND_HISTORY_MAX_ROWS as f32))
                 .overflow_y_scroll()
                 .children(history_items);
 
@@ -1358,8 +1371,9 @@ impl Scratchpad {
                 .child(
                     div()
                         .w(px(560.0))
-                        .p(px(10.0))
+                        .p(px(FIND_DIALOG_PADDING))
                         .bg(rgb(0x1e1e2e))
+                        .relative()
                         .text_size(px(14.0))
                         .flex()
                         .flex_col()
@@ -1395,11 +1409,6 @@ impl Scratchpad {
                                 .child(regex_toggle)
                                 .child(case_toggle),
                         )
-                        .children(if history_open && !recent_finds.is_empty() {
-                            Some(history_list)
-                        } else {
-                            None
-                        })
                         .child(
                             div()
                                 .mt(px(6.0))
@@ -1447,6 +1456,11 @@ impl Scratchpad {
                                         if recent_finds.len() == 1 { "" } else { "s" },
                                     )),
                             )
+                        })
+                        .children(if history_open && !recent_finds.is_empty() {
+                            Some(history_list)
+                        } else {
+                            None
                         }),
                 )
         });
