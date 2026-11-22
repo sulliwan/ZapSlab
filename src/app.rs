@@ -12,7 +12,13 @@
 //!   also the paste and IME path), while editing commands (arrows, backspace,
 //!   enter, shortcuts) are handled in `on_key_down`.
 
-use std::{cell::Cell, ops::Range, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    ops::Range,
+    rc::Rc,
+    time::Duration,
+};
 
 use zapslab_document::{
     Document, byte_offset_for_utf16, display,
@@ -143,6 +149,12 @@ pub struct Scratchpad {
     /// the model in a gpui-free crate lets it be unit-tested in isolation.
     document: Document,
     metrics: Metrics,
+    /// Measured advances for characters the primary monospace font lacks — CJK
+    /// via the Canvas fallback, Arabic/Hebrew/Devanagari/Thai via the embedded
+    /// Noto faces. The editor font and size are fixed, so each distinct char is
+    /// measured once instead of every frame. Interior mutability because the
+    /// geometry helpers take `&self`.
+    fallback_widths: RefCell<HashMap<char, Pixels>>,
     /// Current soft-wrap width in pixels, updated from the viewport each
     /// render. `INFINITY` means "do not wrap".
     wrap_width: Cell<f32>,
@@ -215,6 +227,7 @@ impl Scratchpad {
                 line_height,
                 ascii_width,
             },
+            fallback_widths: RefCell::new(HashMap::new()),
             last_bounds: Rc::new(Cell::new(None)),
             wrap_width: Cell::new(f32::INFINITY),
             did_autofocus: false,
@@ -265,13 +278,23 @@ impl Scratchpad {
 
     fn char_width(&self, ch: char, cx: &App) -> Pixels {
         if ch.is_ascii() {
-            self.metrics.ascii_width
-        } else {
-            cx.text_system()
-                .advance(self.metrics.font_id, px(FONT_SIZE), ch)
-                .map(|advance| advance.width)
-                .unwrap_or(self.metrics.ascii_width)
+            return self.metrics.ascii_width;
         }
+        if let Some(width) = self.fallback_widths.borrow().get(&ch).copied() {
+            return width;
+        }
+        let text_system = cx.text_system();
+        let width = match text_system.advance(self.metrics.font_id, px(FONT_SIZE), ch) {
+            // The primary font covers the glyph; use its advance.
+            Ok(advance) => advance.width,
+            // Glyph absent from the primary font. Shape it through the full
+            // pipeline so fallback fonts (Noto) and the Canvas CJK/emoji
+            // fallback contribute their real advance. Guessing one cell here
+            // would drift the caret and soft-wrap for wide glyphs.
+            Err(_) => text_system.layout_width(self.metrics.font_id, px(FONT_SIZE), ch),
+        };
+        self.fallback_widths.borrow_mut().insert(ch, width);
+        width
     }
 
     /// Width of the editor area (viewport minus the hex panel when open).
@@ -1306,6 +1329,9 @@ impl Scratchpad {
     ) -> AnyElement {
         let metrics = self.hex_metrics(cx);
         let line_height = metrics.line_height;
+        // Highlight the byte currently open in the inline editor so the cell
+        // being changed stays visually tied to the "Edit byte" dialog.
+        let editing_offset = self.byte_edit.as_ref().map(|edit| edit.offset);
 
         let content = match &self.hex_layout {
             Some(layout) => {
@@ -1338,13 +1364,18 @@ impl Scratchpad {
                             selection_start,
                             selection_end,
                         );
+                        let editing = Some(cell.encoded_offset) == editing_offset;
                         let mut cell_div = div()
                             .w(px(metrics.byte_width))
                             .h(px(line_height))
                             .mr(px(metrics.byte_gap))
                             .flex_shrink_0()
                             .child(format!("{:02x}", cell.byte));
-                        if selected {
+                        if editing {
+                            // Draw the byte under edit over the selection so the
+                            // target cell is unmistakable.
+                            cell_div = cell_div.bg(rgb(0xf9e2af)).text_color(rgb(0x11111b));
+                        } else if selected {
                             cell_div = cell_div.bg(rgba(0x89b4fa40));
                         }
                         cells.push(cell_div.into_any_element());
@@ -2060,8 +2091,12 @@ impl Render for Scratchpad {
                 .pt(px(80.0))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|_this, _event, _window, cx| {
+                    cx.listener(|this, _event, _window, cx| {
+                        // Clicking the dimmed backdrop cancels, like Esc and the
+                        // Cancel button.
+                        this.encoding_prompt = None;
                         cx.stop_propagation();
+                        cx.notify();
                     }),
                 )
                 .child(
@@ -2072,6 +2107,14 @@ impl Render for Scratchpad {
                         .text_size(px(14.0))
                         .flex()
                         .flex_col()
+                        // Keep clicks on the dialog's own background from
+                        // bubbling to the backdrop's cancel handler.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
                         .child(
                             div()
                                 .pb(px(6.0))

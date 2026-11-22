@@ -9,12 +9,17 @@ publish = false
 # Bump all three together.
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
-gpui_web = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
 base64 = "0.22"
 zapslab-document = { path = "crates/document" }
 
+# The web backend is constructed directly in `main.rs` so it can opt into the
+# CJK/emoji Canvas fallback, so `gpui_web` is only needed on wasm and
+# `gpui_platform` only on native targets.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+gpui_web = { git = "https://github.com/zed-industries/zed", rev = "2f808b3c2de049ecfdbad0fdb26763cebfcaa3b4", default-features = false }
 # Keep this in lockstep with the wasm-bindgen crate that the pinned zed rev
 # resolves to (0.2.127, via wgpu -> js-sys). The wasm-bindgen-cli in the
 # builder image must match this version exactly.
