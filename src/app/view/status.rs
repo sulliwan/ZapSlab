@@ -100,6 +100,7 @@ impl Scratchpad {
                             // Teal distinguishes the cursor position from the
                             // toggle items next to it.
                             .text_color(rgb(0x94e2d5))
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, window, cx| {
@@ -115,6 +116,7 @@ impl Scratchpad {
                             .text_size(px(12.0))
                             // Neutral label; clicking opens the conversion dialog.
                             .text_color(rgb(0xa6adc8))
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
@@ -133,6 +135,7 @@ impl Scratchpad {
                             } else {
                                 rgb(0x6c7086)
                             })
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
@@ -162,6 +165,7 @@ impl Scratchpad {
                             } else {
                                 rgb(0x6c7086)
                             })
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {
@@ -187,6 +191,7 @@ impl Scratchpad {
                             } else {
                                 rgb(0x6c7086)
                             })
+                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event, _window, cx| {

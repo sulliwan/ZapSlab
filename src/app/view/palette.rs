@@ -165,7 +165,16 @@ impl Scratchpad {
         cx: &mut Context<Self>,
     ) {
         let transform = transforms::TRANSFORMS[index];
-        let result = (transform.apply)(&self.document.text()[start..end]);
+        // Byte-interpreting transforms decode under the hex pane's encoding so
+        // arbitrary binary can round-trip through Latin-1.
+        let encoding = self.hex_encoding;
+        let result = {
+            let input = &self.document.text()[start..end];
+            match transforms::apply_with_encoding(&transform, input, encoding) {
+                Some(result) => result,
+                None => (transform.apply)(input),
+            }
+        };
         self.palette = None;
         match result {
             transforms::TransformResult::Replace(text) => {
@@ -311,14 +320,15 @@ impl Scratchpad {
                 } else {
                     item
                 };
-                let item = item.id(("palette-row", position)).on_click(cx.listener(
-                    move |this, _event: &ClickEvent, window, cx| {
+                let item = item
+                    .id(("palette-row", position))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         if let Some(palette) = &mut this.palette {
                             palette.selected = position;
                         }
                         this.apply_selected_palette_entry(window, cx);
-                    },
-                ));
+                    }));
                 items.push(item.into_any_element());
             }
 

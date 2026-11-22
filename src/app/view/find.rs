@@ -1220,6 +1220,7 @@ impl Scratchpad {
                     .truncate()
                     .flex_shrink_0()
                     .id(("find-history-item", index))
+                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                         this.select_find_history(index, cx);
                     }))
@@ -1267,6 +1268,7 @@ impl Scratchpad {
                     rgb(0x313244)
                 })
                 .id("find-regex-toggle")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.toggle_find_regex(cx);
                 }))
@@ -1288,6 +1290,7 @@ impl Scratchpad {
                     rgb(0x313244)
                 })
                 .id("find-case-toggle")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.toggle_find_case_insensitive(cx);
                 }))
@@ -1306,6 +1309,7 @@ impl Scratchpad {
                 .text_color(action_color)
                 .bg(rgb(0x313244))
                 .id("find-prev")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.find_prev_match(window, cx);
                 }))
@@ -1319,6 +1323,7 @@ impl Scratchpad {
                 .text_color(action_color)
                 .bg(rgb(0x313244))
                 .id("find-next")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.find_next_match(window, cx);
                 }))
@@ -1332,6 +1337,7 @@ impl Scratchpad {
                 .text_color(action_color)
                 .bg(rgb(0x313244))
                 .id("find-replace-one")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.replace_current(window, cx);
                 }))
@@ -1345,6 +1351,7 @@ impl Scratchpad {
                 .text_color(action_color)
                 .bg(rgb(0x313244))
                 .id("find-replace-all")
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.replace_all_find(window, cx);
                 }))

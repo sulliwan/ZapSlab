@@ -26,6 +26,7 @@ impl Scratchpad {
                     } else {
                         rgb(0x1e1e2e)
                     })
+                    .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
@@ -96,6 +97,7 @@ impl Scratchpad {
                                         .text_size(px(12.0))
                                         .text_color(rgb(0x11111b))
                                         .bg(rgb(0x94e2d5))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _event, window, cx| {
@@ -112,6 +114,7 @@ impl Scratchpad {
                                         .text_size(px(12.0))
                                         .text_color(rgb(0x11111b))
                                         .bg(rgb(0x89b4fa))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _event, window, cx| {
@@ -127,6 +130,7 @@ impl Scratchpad {
                                 .mt(px(8.0))
                                 .text_size(px(12.0))
                                 .text_color(rgb(0x6c7086))
+                                .cursor_pointer()
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _event, _window, cx| {
@@ -167,6 +171,7 @@ impl Scratchpad {
                     } else {
                         rgb(0x1e1e2e)
                     })
+                    .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
@@ -190,6 +195,7 @@ impl Scratchpad {
                 .text_size(px(13.0))
                 .text_color(rgb(0xcdd6f4))
                 .bg(rgb(0x313244))
+                .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
@@ -272,6 +278,7 @@ impl Scratchpad {
                                         .text_size(px(12.0))
                                         .text_color(rgb(0x11111b))
                                         .bg(rgb(0x94e2d5))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _event, _window, cx| {
@@ -287,6 +294,7 @@ impl Scratchpad {
                                         .py(px(6.0))
                                         .text_size(px(12.0))
                                         .text_color(rgb(0x6c7086))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _event, _window, cx| {
@@ -480,6 +488,7 @@ impl Scratchpad {
                                         .py(px(6.0))
                                         .text_size(px(12.0))
                                         .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _event, window, cx| {
@@ -496,6 +505,7 @@ impl Scratchpad {
                                         .text_size(px(12.0))
                                         .text_color(rgb(0x11111b))
                                         .bg(rgb(0x94e2d5))
+                                        .cursor_pointer()
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _event, window, cx| {
