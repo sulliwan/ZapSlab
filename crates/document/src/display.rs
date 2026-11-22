@@ -9,8 +9,33 @@
 
 use std::borrow::Cow;
 
+use crate::LineEnding;
 use crate::escape::display_for_cluster;
 use crate::grapheme::grapheme_ranges;
+
+/// How clusters are made visible.
+///
+/// `show_invisibles` escapes every non-printing cluster (`\n`, `\t`, ...) using
+/// the standard notation. `show_line_endings` additionally renders each `\n` as
+/// the document's line-ending style (`\n`, `\r\n`, or `\r`), so the stored style
+/// is visible even when `show_invisibles` is off. When both are set, line
+/// endings use the style-specific form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayOptions {
+    pub show_invisibles: bool,
+    pub show_line_endings: bool,
+    pub line_ending: LineEnding,
+}
+
+impl DisplayOptions {
+    pub fn new(show_invisibles: bool, show_line_endings: bool, line_ending: LineEnding) -> Self {
+        Self {
+            show_invisibles,
+            show_line_endings,
+            line_ending,
+        }
+    }
+}
 
 /// A grapheme plus the text that should actually be drawn for it.
 pub struct DisplayGrapheme<'a> {
@@ -25,10 +50,17 @@ pub struct DisplayGrapheme<'a> {
 /// Iterates the display form of each grapheme in `text`.
 pub fn display_graphemes(
     text: &str,
-    escape_invisibles: bool,
+    options: DisplayOptions,
 ) -> impl Iterator<Item = DisplayGrapheme<'_>> {
     grapheme_ranges(text).map(move |(start, end)| {
-        let (display, escaped) = display_for_cluster(&text[start..end], escape_invisibles);
+        let cluster = &text[start..end];
+        // A line ending is a single `\n` in the buffer, but its visible form
+        // depends on the document's stored style.
+        let (display, escaped) = if cluster == "\n" && options.show_line_endings {
+            (Cow::Borrowed(options.line_ending.display_escape()), true)
+        } else {
+            display_for_cluster(cluster, options.show_invisibles)
+        };
         DisplayGrapheme {
             text_range: (start, end),
             display,
@@ -46,14 +78,14 @@ pub fn wrap_line<F: Fn(&str) -> f32>(
     start: usize,
     end: usize,
     wrap_width: f32,
-    escape_invisibles: bool,
+    options: DisplayOptions,
     width_of: &F,
 ) -> Vec<(usize, usize)> {
     let mut rows = Vec::new();
     let mut chunk_start = start;
     let mut chunk_width = 0.0f32;
 
-    for grapheme in display_graphemes(&text[start..end], escape_invisibles) {
+    for grapheme in display_graphemes(&text[start..end], options) {
         let grapheme_start = start + grapheme.text_range.0;
         let width = width_of(&grapheme.display);
         if chunk_width > 0.0 && chunk_width + width > wrap_width {
@@ -78,13 +110,13 @@ pub fn wrap_count<F: Fn(&str) -> f32>(
     start: usize,
     end: usize,
     wrap_width: f32,
-    escape_invisibles: bool,
+    options: DisplayOptions,
     width_of: &F,
 ) -> usize {
     let mut count = 1usize;
     let mut chunk_width = 0.0f32;
 
-    for grapheme in display_graphemes(&text[start..end], escape_invisibles) {
+    for grapheme in display_graphemes(&text[start..end], options) {
         let width = width_of(&grapheme.display);
         if chunk_width > 0.0 && chunk_width + width > wrap_width {
             count += 1;
@@ -103,14 +135,14 @@ pub fn x_in_row<F: Fn(&str) -> f32>(
     text: &str,
     start: usize,
     offset: usize,
-    escape_invisibles: bool,
+    options: DisplayOptions,
     width_of: &F,
 ) -> f32 {
     let mut x = 0.0f32;
     if start >= offset {
         return x;
     }
-    for grapheme in display_graphemes(&text[start..], escape_invisibles) {
+    for grapheme in display_graphemes(&text[start..], options) {
         let grapheme_start = start + grapheme.text_range.0;
         if grapheme_start >= offset {
             break;
@@ -133,11 +165,11 @@ pub fn offset_for_x_in_row<F: Fn(&str) -> f32>(
     start: usize,
     end: usize,
     target_x: f32,
-    escape_invisibles: bool,
+    options: DisplayOptions,
     width_of: &F,
 ) -> usize {
     let mut x = 0.0f32;
-    for grapheme in display_graphemes(&text[start..end], escape_invisibles) {
+    for grapheme in display_graphemes(&text[start..end], options) {
         let width = width_of(&grapheme.display);
         if target_x < x + width * 0.5 {
             return start + grapheme.text_range.0;
@@ -151,6 +183,11 @@ pub fn offset_for_x_in_row<F: Fn(&str) -> f32>(
 mod tests {
     use super::*;
 
+    /// Invisibles only, LF style: the common case the original tests assumed.
+    fn invisibles(escape: bool) -> DisplayOptions {
+        DisplayOptions::new(escape, false, LineEnding::Lf)
+    }
+
     /// One unit per displayed character, so an escape like `\x18` is 4 wide.
     fn unit_width(display: &str) -> f32 {
         display.chars().count() as f32
@@ -160,20 +197,23 @@ mod tests {
     fn wrapping_uses_display_width_for_escapes() {
         // Four escaped controls are four cells wide each, but one glyph wide raw.
         let text = "\u{18}\u{18}\u{18}\u{18}";
-        let rows = wrap_line(text, 0, text.len(), 5.0, true, &unit_width);
+        let rows = wrap_line(text, 0, text.len(), 5.0, invisibles(true), &unit_width);
         assert_eq!(rows.len(), 4);
     }
 
     #[test]
     fn wrapping_without_escapes_uses_glyph_width() {
         let text = "abcd";
-        let rows = wrap_line(text, 0, text.len(), 2.0, false, &unit_width);
+        let rows = wrap_line(text, 0, text.len(), 2.0, invisibles(false), &unit_width);
         assert_eq!(rows, vec![(0, 2), (2, 4)]);
     }
 
     #[test]
     fn empty_line_is_one_row() {
-        assert_eq!(wrap_line("", 0, 0, 10.0, true, &unit_width), vec![(0, 0)]);
+        assert_eq!(
+            wrap_line("", 0, 0, 10.0, invisibles(true), &unit_width),
+            vec![(0, 0)]
+        );
     }
 
     #[test]
@@ -186,8 +226,9 @@ mod tests {
             ("a\u{18}b", 3.0, true),
         ];
         for (text, width, escape) in cases {
-            let rows = wrap_line(text, 0, text.len(), width, escape, &unit_width);
-            let count = wrap_count(text, 0, text.len(), width, escape, &unit_width);
+            let options = invisibles(escape);
+            let rows = wrap_line(text, 0, text.len(), width, options, &unit_width);
+            let count = wrap_count(text, 0, text.len(), width, options, &unit_width);
             assert_eq!(count, rows.len(), "{text:?} at {width}");
         }
     }
@@ -197,25 +238,63 @@ mod tests {
         let text = "a\u{18}b";
         let after_a = 1;
         let after_control = 2;
-        assert_eq!(x_in_row(text, 0, after_a, true, &unit_width), 1.0);
-        assert_eq!(x_in_row(text, 0, after_control, true, &unit_width), 5.0);
+        assert_eq!(
+            x_in_row(text, 0, after_a, invisibles(true), &unit_width),
+            1.0
+        );
+        assert_eq!(
+            x_in_row(text, 0, after_control, invisibles(true), &unit_width),
+            5.0
+        );
     }
 
     #[test]
     fn offset_round_trips_at_grapheme_starts() {
         let text = "a\u{18}b";
-        let target = x_in_row(text, 0, 2, true, &unit_width);
+        let options = invisibles(true);
+        let target = x_in_row(text, 0, 2, options, &unit_width);
         assert_eq!(
-            offset_for_x_in_row(text, 0, text.len(), target, true, &unit_width),
+            offset_for_x_in_row(text, 0, text.len(), target, options, &unit_width),
             2
         );
         assert_eq!(
-            offset_for_x_in_row(text, 0, text.len(), 0.0, true, &unit_width),
+            offset_for_x_in_row(text, 0, text.len(), 0.0, options, &unit_width),
             0
         );
         assert_eq!(
-            offset_for_x_in_row(text, 0, text.len(), 100.0, true, &unit_width),
+            offset_for_x_in_row(text, 0, text.len(), 100.0, options, &unit_width),
             text.len()
         );
+    }
+
+    #[test]
+    fn line_endings_render_their_style() {
+        let text = "a\nb";
+        let crlf = DisplayOptions::new(false, true, LineEnding::Crlf);
+        let lf = DisplayOptions::new(false, true, LineEnding::Lf);
+        let cr = DisplayOptions::new(false, true, LineEnding::Cr);
+
+        let shown = |options| {
+            display_graphemes(text, options)
+                .map(|grapheme| grapheme.display.into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(crlf), vec!["a", "\\r\\n", "b"]);
+        assert_eq!(shown(lf), vec!["a", "\\n", "b"]);
+        assert_eq!(shown(cr), vec!["a", "\\r", "b"]);
+        // Off without invisibles: the newline stays a plain line break.
+        assert_eq!(
+            shown(DisplayOptions::new(false, false, LineEnding::Crlf)),
+            vec!["a", "\n", "b"]
+        );
+    }
+
+    #[test]
+    fn line_endings_wide_glyph_affects_wrapping() {
+        // `\r\n` is four displayed characters; at width 3 it must wrap.
+        let text = "a\nb";
+        let options = DisplayOptions::new(false, true, LineEnding::Crlf);
+        let rows = wrap_line(text, 0, text.len(), 3.0, options, &unit_width);
+        assert!(rows.len() > 1, "{rows:?}");
     }
 }

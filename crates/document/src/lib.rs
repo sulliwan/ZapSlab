@@ -41,6 +41,46 @@ pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 /// recent edit stays undoable even if it alone exceeds the budget.
 pub const MAX_UNDO_BYTES: usize = 128 * 1024 * 1024;
 
+/// A document's line-ending style.
+///
+/// The buffer itself is always `\n`-only (a hard invariant); the style is kept
+/// as metadata and only materialized at the persistence and clipboard
+/// boundaries. `Mixed` records that the loaded text used more than one style;
+/// it is never a conversion target, and the first explicit conversion (or the
+/// first save, which collapses to `\n`) resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+    Cr,
+    Mixed,
+}
+
+impl LineEnding {
+    /// Styles the user can convert to. `Mixed` is excluded: it is a detected
+    /// observation, not a target.
+    pub const TARGETS: &'static [LineEnding] = &[LineEnding::Lf, LineEnding::Crlf, LineEnding::Cr];
+
+    /// Short label for the status bar and dialog.
+    pub fn label(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "LF",
+            LineEnding::Crlf => "CRLF",
+            LineEnding::Cr => "CR",
+            LineEnding::Mixed => "Mixed",
+        }
+    }
+
+    /// The escape notation rendered when line endings are made visible.
+    pub fn display_escape(self) -> &'static str {
+        match self {
+            LineEnding::Lf | LineEnding::Mixed => "\\n",
+            LineEnding::Crlf => "\\r\\n",
+            LineEnding::Cr => "\\r",
+        }
+    }
+}
+
 /// One reversible edit: undoing replaces `start..start + inserted.len()` with
 /// `removed`; redoing replaces `start..start + removed.len()` with `inserted`.
 /// Its size tracks what the user actually changed, not the document size.
@@ -61,6 +101,28 @@ impl Edit {
     }
 }
 
+/// One entry in the undo/redo history: a text edit or a line-ending conversion.
+///
+/// Conversion is metadata-only (the buffer stays `\n`-only) but still occupies
+/// a single undo step, so undo/redo stay uniform. A line-ending step costs no
+/// retained text bytes.
+enum HistoryStep {
+    Text(Edit),
+    LineEnding {
+        before: LineEnding,
+        after: LineEnding,
+    },
+}
+
+impl HistoryStep {
+    fn size(&self) -> usize {
+        match self {
+            HistoryStep::Text(edit) => edit.size(),
+            HistoryStep::LineEnding { .. } => 0,
+        }
+    }
+}
+
 /// Tracks a run of contiguous single-character insertions so a typing burst
 /// collapses into a single undo step.
 #[derive(Clone, Copy)]
@@ -77,8 +139,11 @@ pub struct Document {
     /// Total UTF-16 code units in `text`, maintained incrementally so the
     /// platform-boundary conversions can walk from the nearer end.
     utf16_len: usize,
-    undo: VecDeque<Edit>,
-    redo: VecDeque<Edit>,
+    /// The document's line-ending style. `text` is always `\n`-only; this is
+    /// materialized only at the persistence and clipboard boundaries.
+    line_ending: LineEnding,
+    undo: VecDeque<HistoryStep>,
+    redo: VecDeque<HistoryStep>,
     /// Retained bytes in `undo`/`redo`, for the `MAX_UNDO_BYTES` budget.
     undo_bytes: usize,
     redo_bytes: usize,
@@ -92,6 +157,9 @@ impl Document {
     /// Builds a document from `text`, normalizing newlines and placing the
     /// cursor at the end.
     pub fn new(text: String) -> Self {
+        // Detect before normalizing: the `\r` bytes are the only record of the
+        // original style, and normalization removes them.
+        let line_ending = detect_line_ending(&text);
         let text = if text.contains('\r') {
             text.replace("\r\n", "\n").replace('\r', "\n")
         } else {
@@ -106,6 +174,7 @@ impl Document {
             anchor: cursor,
             lines,
             utf16_len,
+            line_ending,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             undo_bytes: 0,
@@ -130,6 +199,48 @@ impl Document {
     /// Monotonic counter bumped on every text mutation (edits, undo, redo).
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    // ---- Line endings ---------------------------------------------------
+
+    /// The document's current line-ending style (metadata; `text` stays
+    /// `\n`-only).
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    /// Converts the whole document to `style`. This changes only the stored
+    /// style — the buffer is already `\n`-only — so it is O(1) and cannot grow
+    /// the document. `Mixed` is not a target and is rejected.
+    ///
+    /// Recorded as one undo step and clears redo, like any other edit.
+    pub fn set_line_ending(&mut self, style: LineEnding) -> bool {
+        if style == LineEnding::Mixed || style == self.line_ending {
+            return false;
+        }
+        self.redo.clear();
+        self.redo_bytes = 0;
+        let before = self.line_ending;
+        self.undo.push_back(HistoryStep::LineEnding {
+            before,
+            after: style,
+        });
+        self.evict_undo();
+        self.line_ending = style;
+        self.insert_run = None;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    /// The text with the document's line endings materialized, for persistence
+    /// and clipboard export. `Lf` (and the `Mixed` fallback) borrow, so the
+    /// common case copies nothing extra.
+    pub fn text_with_line_endings(&self) -> Cow<'_, str> {
+        match self.line_ending {
+            LineEnding::Lf | LineEnding::Mixed => Cow::Borrowed(&self.text),
+            LineEnding::Crlf => Cow::Owned(self.text.replace('\n', "\r\n")),
+            LineEnding::Cr => Cow::Owned(self.text.replace('\n', "\r")),
+        }
     }
 
     pub fn cursor(&self) -> usize {
@@ -397,15 +508,17 @@ impl Document {
         let coalesce = single_char
             && self.insert_run.is_some_and(|run| run.end == start)
             && self.cursor == start
-            && self.anchor == start;
+            && self.anchor == start
+            && matches!(self.undo.back(), Some(HistoryStep::Text(_)));
 
         // Any successful edit invalidates the redo history.
         self.redo.clear();
         self.redo_bytes = 0;
 
         if coalesce {
-            // Extend the current typing run's inserted text.
-            if let Some(edit) = self.undo.back_mut() {
+            // Extend the current typing run's inserted text. `coalesce` above
+            // guarantees the back step is a text edit.
+            if let Some(HistoryStep::Text(edit)) = self.undo.back_mut() {
                 edit.inserted.push_str(inserted);
                 self.undo_bytes += inserted.len();
             }
@@ -479,7 +592,7 @@ impl Document {
     /// byte budgets.
     fn push_edit(&mut self, edit: Edit) {
         self.undo_bytes += edit.size();
-        self.undo.push_back(edit);
+        self.undo.push_back(HistoryStep::Text(edit));
         self.evict_undo();
     }
 
@@ -506,46 +619,69 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(edit) = self.undo.pop_back() else {
+        let Some(step) = self.undo.pop_back() else {
             return false;
         };
-        self.undo_bytes = self.undo_bytes.saturating_sub(edit.size());
+        self.undo_bytes = self.undo_bytes.saturating_sub(step.size());
 
-        let inserted_len = edit.inserted.len();
-        debug_assert_eq!(
-            self.text.get(edit.start..edit.start + inserted_len),
-            Some(edit.inserted.as_str()),
-            "undo step does not match the current text"
-        );
-        self.apply_text_edit(edit.start, edit.start + inserted_len, &edit.removed);
-        self.cursor = self.clamp_boundary(edit.before_cursor);
-        self.anchor = self.clamp_boundary(edit.before_anchor);
-        self.insert_run = None;
+        match step {
+            HistoryStep::Text(edit) => {
+                let inserted_len = edit.inserted.len();
+                debug_assert_eq!(
+                    self.text.get(edit.start..edit.start + inserted_len),
+                    Some(edit.inserted.as_str()),
+                    "undo step does not match the current text"
+                );
+                self.apply_text_edit(edit.start, edit.start + inserted_len, &edit.removed);
+                self.cursor = self.clamp_boundary(edit.before_cursor);
+                self.anchor = self.clamp_boundary(edit.before_anchor);
+                self.insert_run = None;
 
-        self.redo_bytes += edit.size();
-        self.redo.push_back(edit);
+                self.redo_bytes += edit.size();
+                self.redo.push_back(HistoryStep::Text(edit));
+            }
+            HistoryStep::LineEnding { before, after } => {
+                // Metadata-only: text, cursor, and anchor are unchanged.
+                self.line_ending = before;
+                self.revision = self.revision.wrapping_add(1);
+                self.insert_run = None;
+                self.redo
+                    .push_back(HistoryStep::LineEnding { before, after });
+            }
+        }
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(edit) = self.redo.pop_back() else {
+        let Some(step) = self.redo.pop_back() else {
             return false;
         };
-        self.redo_bytes = self.redo_bytes.saturating_sub(edit.size());
+        self.redo_bytes = self.redo_bytes.saturating_sub(step.size());
 
-        let removed_len = edit.removed.len();
-        debug_assert_eq!(
-            self.text.get(edit.start..edit.start + removed_len),
-            Some(edit.removed.as_str()),
-            "redo step does not match the current text"
-        );
-        self.apply_text_edit(edit.start, edit.start + removed_len, &edit.inserted);
-        self.cursor = edit.start + edit.inserted.len();
-        self.anchor = self.cursor;
-        self.insert_run = None;
+        match step {
+            HistoryStep::Text(edit) => {
+                let removed_len = edit.removed.len();
+                debug_assert_eq!(
+                    self.text.get(edit.start..edit.start + removed_len),
+                    Some(edit.removed.as_str()),
+                    "redo step does not match the current text"
+                );
+                self.apply_text_edit(edit.start, edit.start + removed_len, &edit.inserted);
+                self.cursor = edit.start + edit.inserted.len();
+                self.anchor = self.cursor;
+                self.insert_run = None;
 
-        self.undo_bytes += edit.size();
-        self.undo.push_back(edit);
+                self.undo_bytes += edit.size();
+                self.undo.push_back(HistoryStep::Text(edit));
+            }
+            HistoryStep::LineEnding { before, after } => {
+                self.line_ending = after;
+                self.revision = self.revision.wrapping_add(1);
+                self.insert_run = None;
+                self.undo
+                    .push_back(HistoryStep::LineEnding { before, after });
+            }
+        }
         true
     }
 }
@@ -557,6 +693,46 @@ fn normalize_newlines(text: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Detects the line-ending style of raw text before it is normalized.
+///
+/// Returns the single style when every terminator agrees, `Mixed` when several
+/// styles appear, and `Lf` when there are no terminators at all (the common
+/// default). `\r\n` is disambiguated from a lone `\r` by looking one byte
+/// ahead.
+pub fn detect_line_ending(text: &str) -> LineEnding {
+    if !text.contains('\r') {
+        return LineEnding::Lf;
+    }
+    let bytes = text.as_bytes();
+    let mut seen: Option<LineEnding> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                let kind = if bytes.get(index + 1) == Some(&b'\n') {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::Cr
+                };
+                if seen.is_some_and(|existing| existing != kind) {
+                    return LineEnding::Mixed;
+                }
+                seen = Some(kind);
+                index += if kind == LineEnding::Crlf { 2 } else { 1 };
+            }
+            b'\n' => {
+                if seen.is_some_and(|existing| existing != LineEnding::Lf) {
+                    return LineEnding::Mixed;
+                }
+                seen = Some(LineEnding::Lf);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    seen.unwrap_or(LineEnding::Lf)
 }
 
 // ---- UTF-16 helpers (the input handler works in UTF-16 offsets) ---------
@@ -622,6 +798,84 @@ mod tests {
         assert_eq!(document.text(), "a\nb\nc");
         assert_eq!(document.cursor(), document.len());
         assert_eq!(document.anchor(), document.len());
+    }
+
+    #[test]
+    fn new_detects_the_line_ending_style() {
+        assert_eq!(doc("a\nb\n").line_ending(), LineEnding::Lf);
+        assert_eq!(doc("a\r\nb\r\n").line_ending(), LineEnding::Crlf);
+        assert_eq!(doc("a\rb\r").line_ending(), LineEnding::Cr);
+        assert_eq!(doc("a\r\nb\rc").line_ending(), LineEnding::Mixed);
+        // No terminators defaults to LF.
+        assert_eq!(doc("abc").line_ending(), LineEnding::Lf);
+        assert_eq!(doc("").line_ending(), LineEnding::Lf);
+    }
+
+    #[test]
+    fn detect_line_ending_distinguishes_crlf_from_lone_cr() {
+        assert_eq!(detect_line_ending("\r\n\r\n"), LineEnding::Crlf);
+        assert_eq!(detect_line_ending("\r\r"), LineEnding::Cr);
+        assert_eq!(detect_line_ending("\n\r"), LineEnding::Mixed);
+        assert_eq!(detect_line_ending("\r\n\n"), LineEnding::Mixed);
+    }
+
+    #[test]
+    fn set_line_ending_is_undoable_and_preserves_selection() {
+        let mut document = doc("a\nb");
+        assert_eq!(document.line_ending(), LineEnding::Lf);
+        document.set_cursor(1, false);
+        document.set_cursor(3, true);
+        let selection = document.selection_range();
+
+        assert!(document.set_line_ending(LineEnding::Crlf));
+        assert_eq!(document.line_ending(), LineEnding::Crlf);
+        // Metadata-only: the selection is untouched.
+        assert_eq!(document.selection_range(), selection);
+
+        assert!(document.undo());
+        assert_eq!(document.line_ending(), LineEnding::Lf);
+        assert_eq!(document.selection_range(), selection);
+
+        assert!(document.redo());
+        assert_eq!(document.line_ending(), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn set_line_ending_rejects_no_op_and_mixed() {
+        let mut document = doc("a\nb");
+        assert!(!document.set_line_ending(LineEnding::Lf));
+        assert!(!document.set_line_ending(LineEnding::Mixed));
+        assert_eq!(document.line_ending(), LineEnding::Lf);
+    }
+
+    #[test]
+    fn conversion_clears_redo() {
+        let mut document = doc("a\nb");
+        assert!(document.insert_text("x"));
+        assert!(document.undo());
+        // A conversion after undo makes the old edit unreachable forward.
+        assert!(document.set_line_ending(LineEnding::Cr));
+        assert!(!document.redo());
+        assert_eq!(document.line_ending(), LineEnding::Cr);
+    }
+
+    #[test]
+    fn text_with_line_endings_materializes_the_style() {
+        let mut document = doc("a\nb\n");
+        assert_eq!(&*document.text_with_line_endings(), "a\nb\n");
+        assert!(document.set_line_ending(LineEnding::Crlf));
+        assert_eq!(&*document.text_with_line_endings(), "a\r\nb\r\n");
+        assert!(document.set_line_ending(LineEnding::Cr));
+        assert_eq!(&*document.text_with_line_endings(), "a\rb\r");
+        // The model's own text stays `\n`-only regardless of the style.
+        assert_eq!(document.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn mixed_line_endings_export_as_plain_lf() {
+        let document = doc("a\r\nb\nc");
+        assert_eq!(document.line_ending(), LineEnding::Mixed);
+        assert_eq!(&*document.text_with_line_endings(), "a\nb\nc");
     }
 
     #[test]
@@ -780,9 +1034,9 @@ mod tests {
     }
 
     fn assert_undo_accounting(document: &Document) {
-        let undo_sum: usize = document.undo.iter().map(Edit::size).sum();
+        let undo_sum: usize = document.undo.iter().map(HistoryStep::size).sum();
         assert_eq!(document.undo_bytes, undo_sum);
-        let redo_sum: usize = document.redo.iter().map(Edit::size).sum();
+        let redo_sum: usize = document.redo.iter().map(HistoryStep::size).sum();
         assert_eq!(document.redo_bytes, redo_sum);
     }
 

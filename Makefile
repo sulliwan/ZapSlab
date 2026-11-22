@@ -13,10 +13,24 @@ WASM_BINDGEN_VERSION ?= 0.2.127
 # Pinned wgpu revision (zed's workspace pin) that vendor-wgpu patches.
 WGPU_REV ?= cddb2f5d80dc0009b2ef6767635140cacf90a007
 
+# Cloudflare Pages deployment. Wrangler is a Node CLI, so it runs from its own
+# image (see docker/Dockerfile.deploy) rather than the Rust builder.
+DEPLOY_IMAGE ?= zapslab-deploy
+NODE_IMAGE ?= node:22-bookworm-slim
+WRANGLER_VERSION ?= 4
+# Direct uploads are production deployments only on the project's production
+# branch; any other branch creates a preview deployment. Default to the usual
+# production branch so `make deploy` actually publishes the site.
+PAGES_BRANCH ?= main
+
 CACHE := $(CURDIR)/.cache
 CARGO_HOME_DIR := $(CACHE)/cargo
 HOME_DIR := $(CACHE)/home
 WGPU_PATCHED := $(CACHE)/wgpu-patched
+
+# Kept outside .cache/ so `make clean` does not log the user out of Cloudflare.
+WRANGLER_HOME_DIR := $(CURDIR)/.wrangler
+WRANGLER_CONFIG := $(CURDIR)/wrangler.toml
 
 # Runtime invocation: source mounted at /app, caches kept inside the project
 # (gitignored). This runtime maps container root to the invoking host user, so
@@ -29,8 +43,21 @@ RUN = $(RUNTIME) run --rm \
 	-e CARGO_NET_GIT_FETCH_WITH_CLI=true \
 	$(IMAGE)
 
+# Deployment runtime: the project is mounted at /app, and HOME points into the
+# gitignored .wrangler/ directory so `wrangler login` credentials persist across
+# the disposable --rm containers. Authentication uses wrangler's OAuth device
+# flow (`wrangler login --device`), which needs no localhost callback and thus
+# works with rootless nerdctl where host networking is unavailable.
+DEPLOY_FLAGS = run --rm \
+	-v "$(CURDIR)":/app \
+	-w /app \
+	-e HOME=/app/.wrangler/home \
+	-e WRANGLER_SEND_METRICS=false
+DEPLOY_RUN = $(RUNTIME) $(DEPLOY_FLAGS) $(DEPLOY_IMAGE)
+DEPLOY_TTY = $(RUNTIME) $(DEPLOY_FLAGS) -it $(DEPLOY_IMAGE)
+
 .DEFAULT_GOAL := help
-.PHONY: help image check test wasm web icons serve shell vendor-wgpu clean
+.PHONY: help image check test wasm web icons serve deploy deploy-image deploy-login shell vendor-wgpu clean
 
 help:
 	@echo "ZapSlab targets:"
@@ -41,6 +68,9 @@ help:
 	@echo "  web    full pipeline: wasm + wasm-bindgen + web assets -> dist/"
 	@echo "  icons  render PWA icons from scripts/zapslab-icon-64.png (host python3 + pillow)"
 	@echo "  serve  serve dist/ on http://localhost:8119 (host python3)"
+	@echo "  deploy  build dist/ and upload it to Cloudflare Pages (PAGES_BRANCH=$(PAGES_BRANCH))"
+	@echo "  deploy-login  log in to Cloudflare (OAuth device flow) without deploying"
+	@echo "  deploy-image  build the wrangler deployment image ($(DEPLOY_IMAGE))"
 	@echo "  shell  interactive shell inside the builder image"
 	@echo "  vendor-wgpu  materialize the patched wgpu source (Firefox/WebGL2 fix)"
 	@echo "  clean  remove target/, dist/ and .cache/"
@@ -49,6 +79,9 @@ help:
 
 $(CARGO_HOME_DIR) $(HOME_DIR):
 	mkdir -p $@
+
+$(WRANGLER_HOME_DIR):
+	mkdir -p $(WRANGLER_HOME_DIR)/home
 
 image:
 	$(RUNTIME) build \
@@ -73,6 +106,30 @@ icons:
 
 serve: web
 	python3 -m http.server 8119 --directory dist
+
+deploy-image:
+	$(RUNTIME) build \
+		--build-arg NODE_IMAGE=$(NODE_IMAGE) \
+		--build-arg WRANGLER_VERSION=$(WRANGLER_VERSION) \
+		-t $(DEPLOY_IMAGE) \
+		-f docker/Dockerfile.deploy docker
+
+deploy-login: deploy-image $(WRANGLER_HOME_DIR)
+	@echo "Logging in to Cloudflare (OAuth device flow)..."
+	$(DEPLOY_TTY) wrangler login --device --browser=false
+
+deploy: web deploy-image $(WRANGLER_HOME_DIR)
+	@test -f $(WRANGLER_CONFIG) || { \
+		echo "error: wrangler.toml is missing." >&2; \
+		echo "       Create it with your Cloudflare Pages project settings:" >&2; \
+		echo "         name = \"zapslab\"" >&2; \
+		echo "         pages_build_output_dir = \"dist\"" >&2; \
+		exit 1; \
+	}
+	@$(DEPLOY_RUN) wrangler whoami --json >/dev/null 2>&1 || $(MAKE) deploy-login
+	$(DEPLOY_TTY) wrangler pages deploy dist \
+		--branch=$(PAGES_BRANCH) \
+		--commit-dirty
 
 shell: $(CARGO_HOME_DIR) $(HOME_DIR)
 	$(RUNTIME) run --rm -it \

@@ -41,7 +41,10 @@ web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
                      + zapslab-icon-64.png (icon source artwork)
 docker/Dockerfile    pinned builder image (Rust + wasm32 + wasm-bindgen + binaryen)
+docker/Dockerfile.deploy  Node + wrangler image for Cloudflare Pages deploys
 Makefile             containerized entry points for every cargo/rust command
+wrangler.toml        Cloudflare Pages project config (gitignored; fill in locally)
+.wrangler/           wrangler login state (gitignored)
 dist/                generated web output (gitignored)
 .cache/              cargo/home caches and patched wgpu (gitignored)
 ```
@@ -57,7 +60,7 @@ lives in the root crate because it depends on `regex`, which is already a root
 dependency via gpui and is not part of the document crate's std-only + Unicode
 dependency set. Keep `crates/document` free of `regex`.
 
-## Build, check, test, and serve
+## Build, check, test, serve, and deploy
 
 All root-crate builds run inside the pinned builder image. The host only needs
 `make` and a container runtime (`nerdctl`, `docker`, or `podman`).
@@ -69,6 +72,9 @@ make test        # run the document crate's unit tests (containerized)
 make wasm        # release wasm build
 make web         # wasm + wasm-bindgen + assets -> dist/
 make serve       # build and serve dist/ at http://localhost:8119
+make deploy      # build dist/ and upload it to Cloudflare Pages
+make deploy-login # log in to Cloudflare (OAuth device flow)
+make deploy-image # build the wrangler deployment image
 make shell       # interactive shell in the builder image
 make icons       # render PWA icons from the source artwork (host python3 + pillow)
 make vendor-wgpu # materialize the patched wgpu source
@@ -91,6 +97,15 @@ Rules:
   it inside the builder image with
   `cargo check --tests --target wasm32-unknown-unknown`; to actually run those
   tests, use a standalone crate that path-includes `src/transforms/mod.rs`.
+- **Deployment uses `wrangler login --device` (OAuth device authorization),
+  not the localhost callback flow.** Rootless nerdctl cannot expose a
+  container's loopback listener to the host browser, so port publishing and
+  host networking are not an option; the device flow needs neither. Login state
+  lives in the gitignored `.wrangler/` (deliberately outside `.cache/`, so
+  `make clean` does not log the user out). `wrangler.toml` is likewise
+  gitignored and must be filled in locally with the Pages project name.
+  `make deploy` uploads onto `PAGES_BRANCH` (default `main`); any other value is
+  a preview deployment in Cloudflare Pages.
 - The `wasm-bindgen` crate pin (`=0.2.127`) and the builder image's
   `wasm-bindgen-cli` must match exactly. The three gpui crates are pinned to one
   zed revision; bump them together.
@@ -177,14 +192,13 @@ Rules:
   `Scratchpad` owns the dialog state, key/input routing, and the overlay.
   Literal and regex searches share one matcher (literal queries are escaped),
   with a regex toggle and a Unicode-aware case-insensitive toggle. Each field
-  keeps its own grapheme-aware caret (arrows, Home/End, Backspace/Delete), and
-  typed text inserts at that caret. Reopening restores the last closed dialog
+  keeps its own grapheme-aware caret (arrows, Home/End, Backspace/Delete),
+  Shift+arrows and mouse drag select within a field, and typed text inserts at
+  the caret (replacing any selection). Reopening restores the last closed dialog
   state (query, replacement, toggles, focused field), and Up/Down in the query
   field recall the 20 most recent queries. Find navigation reuses the document
-  selection to highlight the current match, so
-  "replace all in selection" uses a selection snapshot taken when the dialog
-  opens. Replace-all applies as a single `replace_range` (one undo step) and is
-  size-capped before mutating;
+  selection to highlight the current match. Replace-all applies as a single
+  `replace_range` (one undo step) and is size-capped before mutating;
 - **hex pane**: a virtualized `HexIndex` (only visible rows are materialized,
   carried by spacers) cached by `(document revision, encoding, bytes_per_row)`;
   hit-testing maps encoded byte offsets back to text through the same index. It
@@ -348,10 +362,6 @@ keep the public signatures identical across both.
   buffer (an explicit, user-initiated transformation).
 - **Wrap-on layout rebuild is O(lines log n)** and only runs for documents below
   the auto-disable thresholds; large buffers use wrap-off with O(1) row mapping.
-- **Find/replace is a modal dialog.** While it is open, typing goes to its
-  fields and the editor behind it is occluded, so the selection can only change
-  through find. "Replace all in selection" therefore uses the selection captured
-  at open time, not the live selection (which find moves onto each match).
 - **Regex "find prev" is O(matches).** Backward search has no native regex API,
   so it scans forward up to the cursor; literal backward search is
   `str::rfind`-fast. The dialog shows No matches / Wrapped instead of a live

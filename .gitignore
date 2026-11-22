@@ -27,5 +27,9 @@ rustc-ice-*.txt
 /dist
 /.cache
 
+# Cloudflare Pages deploy: local project settings and wrangler login state
+/wrangler.toml
+/.wrangler
+
 # Standalone pure-model crate: its lockfile is generated when running its tests
 /crates/document/Cargo.lock

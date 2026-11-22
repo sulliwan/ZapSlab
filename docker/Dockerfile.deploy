@@ -1,0 +1,22 @@
+# Deployment image for ZapSlab (Cloudflare Pages).
+#
+# Wrangler is a Node CLI, so it lives in its own small image and the host only
+# needs make + a container runtime. The Makefile mounts the project at /app and
+# points HOME at the gitignored .wrangler/ directory so the interactive OAuth
+# login survives the container being removed.
+
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE}
+
+ARG WRANGLER_VERSION=4
+
+# git lets wrangler attach commit metadata to each Pages deployment. The repo
+# is bind-mounted, and git is run from inside the container.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-fund --no-audit wrangler@${WRANGLER_VERSION} \
+ && npm cache clean --force
+
+WORKDIR /app

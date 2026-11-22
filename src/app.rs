@@ -21,7 +21,8 @@ use std::{
 };
 
 use zapslab_document::{
-    Document, MAX_DOCUMENT_BYTES, byte_offset_for_utf16, display,
+    Document, LineEnding, MAX_DOCUMENT_BYTES, byte_offset_for_utf16, display,
+    display::DisplayOptions,
     encoding::{self, Encoding},
     hexdump::HexIndex,
     utf16_offset,
@@ -31,8 +32,9 @@ use gpui::{
     EntityInputHandler,
     FocusHandle, FontId, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, StyledText, Subscription, Task, UTF16Selection,
-    Window, canvas, div, fill, font, point, px, rgb, rgba, size,
+    ScrollDelta, ScrollEvent, ScrollHandle, StatefulInteractiveElement, Styled, StyledText,
+    Subscription, Task, TextRun, UTF16Selection,
+    Window, canvas, div, fill, font, point, px, rgb, rgba, size, svg,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -63,6 +65,27 @@ const TRANSFORM_CONFIRM_BYTES: usize = 2 * 1024 * 1024;
 const RECENT_TRANSFORMS_MAX: usize = 8;
 /// Recent find queries retained for Up/Down recall in the find dialog.
 const MAX_RECENT_FINDS: usize = 20;
+/// Font size and left/base padding of the find/replace text fields. Mouse
+/// hit-testing shapes the field text at the same size so clicks map correctly.
+const FIND_FIELD_TEXT_SIZE: f32 = 14.0;
+const FIND_FIELD_PADDING: f32 = 6.0;
+/// Minimum height of a find/replace field so an empty field does not collapse
+/// and the two boxes stay the same size.
+const FIND_FIELD_MIN_HEIGHT: f32 = 24.0;
+/// Width of the "Find"/"Replace" labels and of the Find history arrow.
+const FIND_LABEL_WIDTH: f32 = 56.0;
+const FIND_HISTORY_ARROW_WIDTH: f32 = 24.0;
+/// Right inset of the Find field: normal padding plus the chevron hit zone, so
+/// the text never runs underneath the history affordance.
+const FIND_FIELD_RIGHT_PADDING: f32 = FIND_FIELD_PADDING + FIND_HISTORY_ARROW_WIDTH;
+/// Pixels per line for line-based wheel deltas while panning a find field.
+const FIND_SCROLL_LINE_PX: f32 = 20.0;
+/// Width of the ellipsis patch drawn at a field edge when text is scrolled
+/// out of view on that side.
+const FIND_OVERFLOW_PATCH_WIDTH: f32 = 16.0;
+/// A font-independent down chevron, so the history affordance never renders as
+/// a missing-glyph box (the embedded UI fonts do not cover U+25BE).
+const CHEVRON_DOWN_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6z" fill="#a6adc8"/></svg>"##;
 /// How long a transient status-bar hint stays visible.
 const HINT_DURATION: Duration = Duration::from_millis(3600);
 /// Default hex panel width as a fraction of the viewport.
@@ -106,7 +129,9 @@ struct WrapLayout {
     on: bool,
     revision: u64,
     wrap_width: f32,
-    show_invisibles: bool,
+    /// Escape/line-ending settings the rows were measured with. Widths change
+    /// when either toggle or the style changes, so the index must rebuild.
+    options: DisplayOptions,
     prefix: Vec<u32>,
 }
 
@@ -121,7 +146,7 @@ impl WrapLayout {
             return true;
         }
         self.revision == app.document.revision()
-            && self.show_invisibles == app.show_invisibles
+            && self.options == app.display_options()
             // Compare rounded widths so sub-pixel jitter does not rebuild the
             // whole index on every frame.
             && self.wrap_width.round() as u32 == app.wrap_width.get().round() as u32
@@ -212,6 +237,16 @@ struct FindState {
     find_caret: usize,
     /// Byte-offset caret within `replace`, always a char boundary.
     replace_caret: usize,
+    /// Horizontal pan offset (pixels of text hidden on the left) for each
+    /// field. Kept per field so switching focus does not lose the view.
+    find_scroll: f32,
+    replace_scroll: f32,
+    /// Selection anchor within `find`; equals `find_caret` when nothing is
+    /// selected.
+    find_anchor: usize,
+    /// Selection anchor within `replace`; equals `replace_caret` when nothing is
+    /// selected.
+    replace_anchor: usize,
     field: FindField,
     regex: bool,
     case_insensitive: bool,
@@ -224,10 +259,10 @@ struct FindState {
     history_index: Option<usize>,
     /// The live query stashed when history browsing starts, restored by Down.
     history_draft: Option<String>,
-    /// The document selection at the moment the dialog opened. Find navigation
-    /// reuses the document selection to highlight matches, so "replace all in
-    /// selection" must remember the user's original range instead.
-    selection: Option<(usize, usize)>,
+    /// Field currently being dragged with the mouse, if any.
+    field_drag: Option<FindField>,
+    /// Whether the recent-finds dropdown is open below the Find field.
+    history_open: bool,
 }
 
 impl FindState {
@@ -256,6 +291,32 @@ impl FindState {
         match self.field {
             FindField::Find => self.find_caret = caret,
             FindField::Replace => self.replace_caret = caret,
+        }
+    }
+
+    fn anchor(&self) -> usize {
+        match self.field {
+            FindField::Find => self.find_anchor,
+            FindField::Replace => self.replace_anchor,
+        }
+    }
+
+    fn set_anchor(&mut self, anchor: usize) {
+        match self.field {
+            FindField::Find => self.find_anchor = anchor,
+            FindField::Replace => self.replace_anchor = anchor,
+        }
+    }
+
+    /// Ordered selection in the active field, clamped to its length.
+    fn selection(&self) -> (usize, usize) {
+        let len = self.active().len();
+        let caret = self.caret().min(len);
+        let anchor = self.anchor().min(len);
+        if caret <= anchor {
+            (caret, anchor)
+        } else {
+            (anchor, caret)
         }
     }
 
@@ -291,6 +352,16 @@ fn snap_boundary(text: &str, at: usize) -> usize {
     at
 }
 
+/// Forces pasted/typed input to a single line so the field stays one row and
+/// the text shaper (which asserts on newlines) is safe.
+fn field_input(text: &str) -> String {
+    if text.contains('\n') || text.contains('\r') {
+        text.replace('\n', " ").replace('\r', " ")
+    } else {
+        text.to_string()
+    }
+}
+
 fn previous_grapheme_start(text: &str, caret: usize) -> usize {
     text[..caret]
         .grapheme_indices(true)
@@ -307,20 +378,125 @@ fn next_grapheme_end(text: &str, caret: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Renders a field's text with an inline block caret at `caret` (byte offset)
-/// when the field is active. The caret is an inserted glyph, matching the
-/// palette/jump prompts; it shifts following text by one cell, which is fine for
-/// these short fields.
-fn field_display(text: &str, caret: usize, active: bool) -> String {
-    if !active {
-        return text.to_string();
+fn find_field_run(text: &str) -> TextRun {
+    TextRun {
+        len: text.len(),
+        font: font(".SystemUIFont"),
+        color: rgb(0xf5e0dc).into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
     }
+}
+
+/// Byte index in `text` nearest to the `x` offset within its laid-out line.
+/// Shapes the line at the field's font and size so this works for the
+/// proportional UI font, not just monospace.
+fn closest_index_for_x(text: &str, x: Pixels, window: &Window) -> usize {
+    let layout = window
+        .text_system()
+        .layout_line(text, px(FIND_FIELD_TEXT_SIZE), &[find_field_run(text)], None);
+    let mut index = layout.closest_index_for_x(x);
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Right inset of a field: the Find field reserves room for the chevron.
+fn find_field_right_padding(field: FindField) -> f32 {
+    match field {
+        FindField::Find => FIND_FIELD_RIGHT_PADDING,
+        FindField::Replace => FIND_FIELD_PADDING,
+    }
+}
+
+/// How much of a field's text is scrolled out of view, as `(left, right)`.
+/// Used to draw the edge ellipses that indicate there is more text.
+fn find_field_overflow(
+    text: &str,
+    scroll: f32,
+    bounds: Option<Bounds<Pixels>>,
+    right_padding: f32,
+    window: &Window,
+) -> (bool, bool) {
+    let Some(bounds) = bounds else {
+        return (false, false);
+    };
+    let visible_width =
+        (f32::from(bounds.size.width) - FIND_FIELD_PADDING - right_padding).max(0.0);
+    if visible_width <= 0.0 {
+        return (false, false);
+    }
+    let layout = window
+        .text_system()
+        .layout_line(text, px(FIND_FIELD_TEXT_SIZE), &[find_field_run(text)], None);
+    let text_width = f32::from(layout.width);
+    (scroll > 0.5, text_width - scroll > visible_width + 0.5)
+}
+
+/// Paints a find/replace field's selection and caret over its single, stable
+/// text element. The text is never reflowed to make room for the caret, so
+/// moving the caret only moves the overlay and leaves the letters put. Both
+/// the selection and the caret are clamped to the field's visible width so a
+/// long, horizontally-panned string never paints outside the box.
+fn paint_find_field_overlay(
+    bounds: Bounds<Pixels>,
+    text: &str,
+    caret: usize,
+    anchor: usize,
+    scroll: f32,
+    right_padding: f32,
+    active: bool,
+    window: &mut Window,
+) {
+    if !active {
+        return;
+    }
+    let layout = window
+        .text_system()
+        .layout_line(text, px(FIND_FIELD_TEXT_SIZE), &[find_field_run(text)], None);
     let caret = snap_boundary(text, caret);
-    let mut out = String::with_capacity(text.len() + 3);
-    out.push_str(&text[..caret]);
-    out.push('\u{258F}');
-    out.push_str(&text[caret..]);
-    out
+    let anchor = snap_boundary(text, anchor);
+    let (sel_start, sel_end) = if caret <= anchor {
+        (caret, anchor)
+    } else {
+        (anchor, caret)
+    };
+
+    let origin_x = f32::from(bounds.origin.x) + FIND_FIELD_PADDING;
+    let visible_width =
+        (f32::from(bounds.size.width) - FIND_FIELD_PADDING - right_padding).max(0.0);
+    // `layout_line` still reports the font's ascent/descent for an empty line,
+    // but guard against a zero-height layout so the caret never vanishes.
+    let measured_height = f32::from(layout.ascent) + f32::from(layout.descent);
+    let line_height = if measured_height > 0.0 {
+        measured_height
+    } else {
+        FIND_FIELD_TEXT_SIZE + 2.0
+    };
+    let y = f32::from(bounds.origin.y) + (f32::from(bounds.size.height) - line_height) * 0.5;
+
+    if sel_start != sel_end {
+        let clamp = |x: f32| (x - scroll).clamp(0.0, visible_width);
+        let x0 = clamp(f32::from(layout.x_for_index(sel_start)));
+        let x1 = clamp(f32::from(layout.x_for_index(sel_end)));
+        if x1 > x0 {
+            let selection = Bounds {
+                origin: point(px(origin_x + x0), px(y)),
+                size: size(px(x1 - x0), px(line_height)),
+            };
+            window.paint_quad(fill(selection, rgba(0x45475a66)));
+        }
+    }
+
+    let caret_x = (f32::from(layout.x_for_index(caret)) - scroll)
+        .clamp(0.0, (visible_width - CARET_WIDTH).max(0.0));
+    let caret_bar = Bounds {
+        origin: point(px(origin_x + caret_x), px(y)),
+        size: size(px(CARET_WIDTH), px(line_height)),
+    };
+    window.paint_quad(fill(caret_bar, rgb(0xf5e0dc)));
 }
 
 #[derive(Clone, Copy)]
@@ -339,6 +515,13 @@ struct PanelDrag {
 #[derive(Clone, Copy)]
 struct EncodingPrompt {
     selected: Encoding,
+}
+
+/// Modal state for converting and displaying line endings.
+#[derive(Clone, Copy)]
+struct LineEndingPrompt {
+    /// Target style highlighted in the dialog; `Mixed` is never selectable.
+    selected: LineEnding,
 }
 
 /// Inline editor for a single encoded byte.
@@ -427,9 +610,21 @@ pub struct Scratchpad {
     recent_finds: Vec<String>,
     /// Last closed find/replace dialog state, restored when it reopens.
     last_find: Option<storage::SavedFindState>,
+    /// Bounds of the find/replace fields, recorded in paint for mouse
+    /// hit-testing (the dialog's text is not a real text input).
+    find_query_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    find_replace_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Active find field's `(field, caret, text length)` from the last frame
+    /// that auto-scrolled it. Used to scroll the caret into view only when the
+    /// caret or text actually changed, so a manual pan is not snapped back.
+    find_scroll_key: Option<(FindField, usize, usize)>,
     /// Render non-printing/invisible characters as colored escape sequences.
     /// On by default: the buffer is often inspected as near-binary data.
     show_invisibles: bool,
+    /// Render each line ending as its style (`\n`, `\r\n`, `\r`) even when
+    /// invisibles are off. Toggled from the status bar and the line-ending
+    /// dialog.
+    show_line_endings: bool,
     /// Whether the right-hand hex panel is open.
     hex_panel: bool,
     /// Encoding the hex panel renders the buffer in.
@@ -453,8 +648,14 @@ pub struct Scratchpad {
     /// Device-pixel-snapped hex row height, refreshed each render so rows,
     /// hit-testing, and painting share one row pitch.
     hex_line_height: Cell<f32>,
+    /// Device-pixel-snapped hex glyph advance, refreshed each render so the
+    /// per-cell widths and gaps (and therefore hit-testing) land on the same
+    /// pixel grid as the painted flex row.
+    hex_ascii_width: Cell<f32>,
     /// Modal for choosing an encoding and a conversion direction.
     encoding_prompt: Option<EncodingPrompt>,
+    /// Modal for converting line endings / toggling their display.
+    line_ending_prompt: Option<LineEndingPrompt>,
     /// Inline editor for a single hex byte, opened by double-clicking it.
     byte_edit: Option<ByteEdit>,
     /// Modal for jumping to a 1-based line number, opened from the status bar.
@@ -521,6 +722,9 @@ impl Scratchpad {
             .ch_advance(font_id, px(FONT_SIZE))
             .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX));
         let line_height = px(FONT_SIZE * LINE_HEIGHT_RATIO);
+        let hex_ascii_width = text_system
+            .ch_advance(font_id, px(HEX_FONT_SIZE))
+            .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX * HEX_FONT_SIZE / FONT_SIZE));
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -543,7 +747,11 @@ impl Scratchpad {
             recent_transforms: storage::load_recent(),
             recent_finds: storage::load_recent_finds(),
             last_find: storage::load_find_state(),
+            find_query_bounds: Rc::new(Cell::new(None)),
+            find_replace_bounds: Rc::new(Cell::new(None)),
+            find_scroll_key: None,
             show_invisibles: true,
+            show_line_endings: false,
             word_wrap,
             hex_panel: false,
             hex_encoding: Encoding::Utf8,
@@ -556,7 +764,9 @@ impl Scratchpad {
             hex_index: None,
             hex_index_key: None,
             hex_line_height: Cell::new(HEX_FONT_SIZE * LINE_HEIGHT_RATIO),
+            hex_ascii_width: Cell::new(f32::from(hex_ascii_width)),
             encoding_prompt: None,
+            line_ending_prompt: None,
             byte_edit: None,
             jump_prompt: None,
             cursor_status_cache: None,
@@ -670,12 +880,21 @@ impl Scratchpad {
         )
     }
 
-    fn hex_metrics(&self, cx: &App) -> HexMetrics {
-        let ascii_width = cx
-            .text_system()
-            .ch_advance(self.metrics.font_id, px(HEX_FONT_SIZE))
-            .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX * HEX_FONT_SIZE / FONT_SIZE));
-        HexMetrics::new(f32::from(ascii_width), self.hex_line_height.get())
+    /// Raw (unsnapped) advance of the hex font, read from the text system.
+    fn hex_ascii_advance(&self, cx: &App) -> f32 {
+        f32::from(
+            cx.text_system()
+                .ch_advance(self.metrics.font_id, px(HEX_FONT_SIZE))
+                .unwrap_or(px(FALLBACK_ASCII_WIDTH_PX * HEX_FONT_SIZE / FONT_SIZE)),
+        )
+    }
+
+    /// Hex-panel geometry from the device-pixel-snapped metrics refreshed each
+    /// render. Snapping the advance (not just the row height) keeps every cell
+    /// origin on the pixel grid, so pointer hit-testing matches the painted
+    /// cells instead of drifting by a fraction of a pixel per column.
+    fn hex_metrics(&self) -> HexMetrics {
+        HexMetrics::new(self.hex_ascii_width.get(), self.hex_line_height.get())
     }
 
     /// Width of a piece of display text, using the same per-glyph metric as the
@@ -716,7 +935,7 @@ impl Scratchpad {
                 on: false,
                 revision: self.document.revision(),
                 wrap_width: f32::INFINITY,
-                show_invisibles: self.show_invisibles,
+                options: self.display_options(),
                 prefix: Vec::new(),
             };
         }
@@ -724,19 +943,13 @@ impl Scratchpad {
         let wrap_width = self.wrap_width.get();
         let text = self.document.text();
         let width_of = self.width_fn(cx);
+        let options = self.display_options();
         let mut prefix = Vec::with_capacity(self.document.line_count() + 1);
         prefix.push(0u32);
         let mut total = 0u32;
         for line in 0..self.document.line_count() {
-            let (start, end) = self.document.line_range(line);
-            let count = display::wrap_count(
-                text,
-                start,
-                end,
-                wrap_width,
-                self.show_invisibles,
-                &width_of,
-            ) as u32;
+            let (start, end) = self.line_display_range(line);
+            let count = display::wrap_count(text, start, end, wrap_width, options, &width_of) as u32;
             total = total.saturating_add(count);
             prefix.push(total);
         }
@@ -745,7 +958,7 @@ impl Scratchpad {
             on: true,
             revision: self.document.revision(),
             wrap_width,
-            show_invisibles: self.show_invisibles,
+            options,
             prefix,
         }
     }
@@ -780,7 +993,7 @@ impl Scratchpad {
         let first_line = layout.line_of_row(first);
         let last_line = layout.line_of_row(last);
         for line in first_line..=last_line {
-            let (start, end) = self.document.line_range(line);
+            let (start, end) = self.line_display_range(line);
             let base = layout.row_of_line(line);
             if layout.on {
                 for (index, (chunk_start, chunk_end)) in display::wrap_line(
@@ -788,7 +1001,7 @@ impl Scratchpad {
                     start,
                     end,
                     layout.wrap_width,
-                    layout.show_invisibles,
+                    layout.options,
                     &width_of,
                 )
                 .into_iter()
@@ -809,7 +1022,7 @@ impl Scratchpad {
     /// `(source line, start byte, end byte)` for a single visual row.
     fn row_at(&self, layout: &WrapLayout, cx: &App, index: u32) -> (usize, usize, usize) {
         let line = layout.line_of_row(index);
-        let (start, end) = self.document.line_range(line);
+        let (start, end) = self.line_display_range(line);
         if !layout.on {
             return (line, start, end);
         }
@@ -819,7 +1032,7 @@ impl Scratchpad {
             start,
             end,
             layout.wrap_width,
-            layout.show_invisibles,
+            layout.options,
             &self.width_fn(cx),
         )
         .get(chunk)
@@ -834,13 +1047,13 @@ impl Scratchpad {
         if !layout.on {
             return base;
         }
-        let (start, end) = self.document.line_range(line);
+        let (start, end) = self.line_display_range(line);
         let chunk = display::wrap_line(
             self.document.text(),
             start,
             end,
             layout.wrap_width,
-            layout.show_invisibles,
+            layout.options,
             &self.width_fn(cx),
         )
         .iter()
@@ -856,7 +1069,7 @@ impl Scratchpad {
         let mut escaped_runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
         let mut escaped_start: Option<usize> = None;
 
-        for grapheme in display::display_graphemes(&text[start..end], self.show_invisibles) {
+        for grapheme in display::display_graphemes(&text[start..end], self.display_options()) {
             if grapheme.escaped {
                 escaped_start.get_or_insert(display_text.len());
             } else if let Some(run_start) = escaped_start.take() {
@@ -895,7 +1108,7 @@ impl Scratchpad {
     fn measure_all_line_widths(&self, cx: &App) -> f32 {
         let mut max = 0.0f32;
         for line in 0..self.document.line_count() {
-            let (start, end) = self.document.line_range(line);
+            let (start, end) = self.line_display_range(line);
             max = max.max(f32::from(self.x_in_row(start, end, cx)));
         }
         max
@@ -910,7 +1123,7 @@ impl Scratchpad {
         let last = self.document.line_of_offset(end).min(last_line);
         let mut max = self.content_max_width.get();
         for line in first..=last {
-            let (line_start, line_end) = self.document.line_range(line);
+            let (line_start, line_end) = self.line_display_range(line);
             max = max.max(f32::from(self.x_in_row(line_start, line_end, cx)));
         }
         self.content_max_width.set(max);
@@ -926,7 +1139,7 @@ impl Scratchpad {
             self.document.text(),
             start,
             offset,
-            self.show_invisibles,
+            self.display_options(),
             &width_of,
         ))
     }
@@ -938,9 +1151,32 @@ impl Scratchpad {
             start,
             end,
             f32::from(x),
-            self.show_invisibles,
+            self.display_options(),
             &width_of,
         )
+    }
+
+    /// The current escape/line-ending display settings.
+    fn display_options(&self) -> DisplayOptions {
+        DisplayOptions::new(
+            self.show_invisibles,
+            self.show_line_endings,
+            self.document.line_ending(),
+        )
+    }
+
+    /// The byte range a line is measured and rendered over. Normally this
+    /// excludes the trailing newline (the line break is implicit); when line
+    /// endings are shown, the newline is included so its escape is measured,
+    /// wrapped, and drawn as part of the line.
+    fn line_display_range(&self, line: usize) -> (usize, usize) {
+        let (start, end) = self.document.line_range(line);
+        if self.show_line_endings && end < self.document.len() {
+            // Every line but the last ends with `\n`; `end` points at it.
+            (start, end + 1)
+        } else {
+            (start, end)
+        }
     }
 
     fn offset_for_window_point(
@@ -955,8 +1191,12 @@ impl Scratchpad {
         let layout = self.wrap_layout(cx);
         let total = layout.total_rows(&self.document);
         let row = ((relative_y / line_height).floor() as u32).min(total.saturating_sub(1));
-        let (_, start, end) = self.row_at(&layout, cx, row);
-        self.offset_for_x_in_row(start, end, px(relative_x), cx)
+        let (line, start, end) = self.row_at(&layout, cx, row);
+        let offset = self.offset_for_x_in_row(start, end, px(relative_x), cx);
+        // A click on a drawn line-ending marker maps to the line's content end,
+        // not to the start of the next line.
+        let (_, content_end) = self.document.line_range(line);
+        self.document.clamp_boundary(offset.min(content_end))
     }
 
     /// Bounds reported to the platform (IME / candidate popover). This must
@@ -1015,8 +1255,11 @@ impl Scratchpad {
         self._save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(debounce).await;
             // Copy the text only once the debounce fires, not on every keystroke.
-            let Ok(text) = this.update(&mut *cx, |view, _cx| view.document.text().to_string())
-            else {
+            // Materialize the line-ending style so a CRLF document is persisted
+            // as CRLF.
+            let Ok(text) = this.update(&mut *cx, |view, _cx| {
+                view.document.text_with_line_endings().into_owned()
+            }) else {
                 return;
             };
             let failed = storage::save(&text).await.is_err();
@@ -1030,7 +1273,7 @@ impl Scratchpad {
     /// Flushes the pending autosave immediately (e.g. when focus leaves), so a
     /// debounced edit is never lost.
     fn flush_save(&mut self, cx: &mut Context<Self>) {
-        let text = self.document.text().to_string();
+        let text = self.document.text_with_line_endings().into_owned();
         self._save_task = Some(cx.spawn(async move |this, cx| {
             let failed = storage::save(&text).await.is_err();
             let _ = this.update(&mut *cx, |view, cx| {
@@ -1159,8 +1402,12 @@ impl Scratchpad {
             let x = self.x_in_row(row_start, cursor, cx);
             let target =
                 (current as i64 + delta as i64).clamp(0, total.saturating_sub(1) as i64) as u32;
-            let (_, start, end) = self.row_at(&layout, cx, target);
-            self.offset_for_x_in_row(start, end, x, cx)
+            let (target_line, start, end) = self.row_at(&layout, cx, target);
+            let offset = self.offset_for_x_in_row(start, end, x, cx);
+            // Clamp to the target line's content end so vertical movement never
+            // lands past a drawn line-ending marker.
+            let (_, content_end) = self.document.line_range(target_line);
+            self.document.clamp_boundary(offset.min(content_end))
         };
         self.set_cursor(offset, extend, cx);
     }
@@ -1183,12 +1430,18 @@ impl Scratchpad {
     }
 
     /// Writes the current selection to the system clipboard, if non-empty.
+    /// Copies use the document's line-ending style, so copying out of a CRLF
+    /// document yields CRLF bytes even though the buffer is `\n`-only.
     fn write_selection_to_clipboard(&self, cx: &mut Context<Self>) {
         let (start, end) = self.document.selection_range();
         if start != end {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.document.text()[start..end].to_string(),
-            ));
+            let selected = &self.document.text()[start..end];
+            let text = match self.document.line_ending() {
+                LineEnding::Lf | LineEnding::Mixed => selected.to_string(),
+                LineEnding::Crlf => selected.replace('\n', "\r\n"),
+                LineEnding::Cr => selected.replace('\n', "\r"),
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
@@ -1236,6 +1489,16 @@ impl Scratchpad {
         if self.encoding_prompt.is_some() {
             if keystroke.key.as_str() == "escape" {
                 self.encoding_prompt = None;
+                cx.notify();
+            }
+            return true;
+        }
+
+        // The line-ending dialog is modal: swallow typing so it never edits the
+        // document behind the overlay; Escape cancels.
+        if self.line_ending_prompt.is_some() {
+            if keystroke.key.as_str() == "escape" {
+                self.line_ending_prompt = None;
                 cx.notify();
             }
             return true;
@@ -1441,10 +1704,10 @@ impl Scratchpad {
 
     // ---- Find / replace -------------------------------------------------
 
-    /// Ctrl/Cmd+F toggles the floating find/replace dialog. Reopening restores
-    /// the last closed dialog state; on the first open it seeds the query from
-    /// the current single-line selection and jumps to the first match at or
-    /// after the selection start.
+    /// Ctrl/Cmd+F toggles the floating find/replace dialog. A current
+    /// single-line selection becomes the find query (fully selected) so typing
+    /// replaces it; otherwise the last closed dialog state is restored. It jumps
+    /// to the first match at or after the selection start.
     fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.is_some() {
             self.close_find(window, cx);
@@ -1457,41 +1720,62 @@ impl Scratchpad {
             None
         };
 
-        let (find, replace, regex, case_insensitive, field) = match self.last_find.clone() {
-            Some(saved) => (
-                saved.find,
-                saved.replace,
-                saved.regex,
-                saved.case_insensitive,
-                if saved.replace_focused {
-                    FindField::Replace
+        let seed = match selection {
+            Some((start, end)) => {
+                let text = &self.document.text()[start..end];
+                if !text.contains('\n') && text.len() <= 512 {
+                    Some(text.to_string())
                 } else {
-                    FindField::Find
-                },
-            ),
-            None => {
-                let seed = match selection {
-                    Some((start, end)) => {
-                        let text = &self.document.text()[start..end];
-                        if !text.contains('\n') && text.len() <= 512 {
-                            text.to_string()
-                        } else {
-                            String::new()
-                        }
-                    }
-                    None => String::new(),
-                };
-                (seed, String::new(), false, false, FindField::Find)
+                    None
+                }
             }
+            None => None,
         };
 
-        let find_caret = find.len();
-        let replace_caret = replace.len();
+        let (find, replace, regex, case_insensitive, field, select_find) =
+            match (seed, self.last_find.clone()) {
+                // A live selection always becomes the find query, fully selected.
+                (Some(find), saved) => {
+                    let (replace, regex, case_insensitive) = match saved {
+                        Some(saved) => (saved.replace, saved.regex, saved.case_insensitive),
+                        None => (String::new(), false, false),
+                    };
+                    (find, replace, regex, case_insensitive, FindField::Find, true)
+                }
+                // No selection: restore the last closed dialog.
+                (None, Some(saved)) => (
+                    saved.find,
+                    saved.replace,
+                    saved.regex,
+                    saved.case_insensitive,
+                    if saved.replace_focused {
+                        FindField::Replace
+                    } else {
+                        FindField::Find
+                    },
+                    false,
+                ),
+                (None, None) => (
+                    String::new(),
+                    String::new(),
+                    false,
+                    false,
+                    FindField::Find,
+                    false,
+                ),
+            };
+
+        let find_len = find.len();
+        let replace_len = replace.len();
         self.find = Some(FindState {
             find,
             replace,
-            find_caret,
-            replace_caret,
+            find_caret: find_len,
+            replace_caret: replace_len,
+            find_scroll: 0.0,
+            replace_scroll: 0.0,
+            find_anchor: if select_find { 0 } else { find_len },
+            replace_anchor: replace_len,
             field,
             regex,
             case_insensitive,
@@ -1501,8 +1785,15 @@ impl Scratchpad {
             wrapped: false,
             history_index: None,
             history_draft: None,
-            selection,
+            field_drag: None,
+            history_open: false,
         });
+        // Seed the scroll key with the freshly opened state so the first frame
+        // shows the start of the query instead of auto-scrolling to the caret.
+        self.find_scroll_key = self
+            .find
+            .as_ref()
+            .map(|state| (state.field, state.caret(), state.active().len()));
         self.palette = None;
         self.refresh_find(sel_start);
         window.notify_text_input_changed(&self.focus_handle);
@@ -1520,6 +1811,11 @@ impl Scratchpad {
         if let Some(state) = &mut self.find {
             state.field = FindField::Replace;
         }
+        // Keep the replacement field's view still on the first frame, like open.
+        self.find_scroll_key = self
+            .find
+            .as_ref()
+            .map(|state| (state.field, state.caret(), state.active().len()));
         self.palette = None;
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
@@ -1542,6 +1838,10 @@ impl Scratchpad {
         }
         self.record_find();
         self.find = None;
+        self.find_scroll_key = None;
+        // Keep the recorded field bounds: the dialog is a fixed width, so the
+        // next open can draw its edge ellipses on the very first frame instead
+        // of waiting for a paint.
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
@@ -1565,6 +1865,8 @@ impl Scratchpad {
         let _ = storage::save_recent_finds(&self.recent_finds);
         if let Some(state) = &mut self.find {
             state.reset_history();
+            // Committing a find dismisses the history dropdown.
+            state.history_open = false;
         }
     }
 
@@ -1595,6 +1897,7 @@ impl Scratchpad {
             state.find = query;
             let len = state.find.len();
             state.find_caret = len;
+            state.find_anchor = len;
         }
         self.after_find_query_changed(cx);
     }
@@ -1622,10 +1925,43 @@ impl Scratchpad {
             state.find = query;
             let len = state.find.len();
             state.find_caret = len;
+            state.find_anchor = len;
             state.history_index = index;
             if index.is_none() {
                 state.history_draft = None;
             }
+        }
+        self.after_find_query_changed(cx);
+    }
+
+    /// Toggles the recent-finds dropdown below the Find field. Opening it also
+    /// focuses the Find field, since the dropdown belongs to that field.
+    fn toggle_find_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            return;
+        }
+        if let Some(state) = &mut self.find {
+            state.field = FindField::Find;
+            state.history_open = !state.history_open;
+        }
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Chooses a recent query from the dropdown: fills the Find field, closes
+    /// the dropdown, and refreshes the live match.
+    fn select_find_history(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(query) = self.recent_finds.get(index).cloned() else {
+            return;
+        };
+        if let Some(state) = &mut self.find {
+            state.field = FindField::Find;
+            state.find = query;
+            let len = state.find.len();
+            state.find_caret = len;
+            state.find_anchor = len;
+            state.history_open = false;
+            state.reset_history();
         }
         self.after_find_query_changed(cx);
     }
@@ -1642,6 +1978,13 @@ impl Scratchpad {
         // Ctrl/Cmd+F toggles the dialog closed, mirroring how it opened it.
         if (modifiers.platform || modifiers.control) && keystroke.key == "f" {
             self.close_find(window, cx);
+            return true;
+        }
+
+        // Ctrl/Cmd+A selects the whole active field, like a real text input.
+        if (modifiers.platform || modifiers.control) && keystroke.key == "a" {
+            self.select_all_find(cx);
+            window.notify_text_input_changed(&self.focus_handle);
             return true;
         }
 
@@ -1673,28 +2016,32 @@ impl Scratchpad {
                 window.notify_text_input_changed(&self.focus_handle);
             }
             "left" => {
-                self.move_find_caret(false, cx);
+                self.move_find_caret(false, modifiers.shift, cx);
                 window.notify_text_input_changed(&self.focus_handle);
             }
             "right" => {
-                self.move_find_caret(true, cx);
+                self.move_find_caret(true, modifiers.shift, cx);
                 window.notify_text_input_changed(&self.focus_handle);
             }
             "home" => {
-                self.move_find_caret_home(cx);
+                self.move_find_caret_home(modifiers.shift, cx);
                 window.notify_text_input_changed(&self.focus_handle);
             }
             "end" => {
-                self.move_find_caret_end(cx);
+                self.move_find_caret_end(modifiers.shift, cx);
                 window.notify_text_input_changed(&self.focus_handle);
             }
             "up" => {
-                self.find_history_prev(cx);
-                window.notify_text_input_changed(&self.focus_handle);
+                if !modifiers.shift {
+                    self.find_history_prev(cx);
+                    window.notify_text_input_changed(&self.focus_handle);
+                }
             }
             "down" => {
-                self.find_history_next(cx);
-                window.notify_text_input_changed(&self.focus_handle);
+                if !modifiers.shift {
+                    self.find_history_next(cx);
+                    window.notify_text_input_changed(&self.focus_handle);
+                }
             }
             _ => {
                 // On web, printable keys fall through to the input handler,
@@ -1744,9 +2091,15 @@ impl Scratchpad {
             let Some(state) = &mut self.find else {
                 return;
             };
-            let caret = snap_boundary(state.active(), state.caret());
-            state.active_mut().insert_str(caret, text);
-            state.set_caret(caret + text.len());
+            let insert = field_input(text);
+            let (start, end) = state.selection();
+            let text_ref = state.active();
+            let start = snap_boundary(text_ref, start);
+            let end = snap_boundary(text_ref, end).max(start);
+            state.active_mut().replace_range(start..end, &insert);
+            let caret = start + insert.len();
+            state.set_caret(caret);
+            state.set_anchor(caret);
             let editing_find = state.field == FindField::Find;
             if editing_find {
                 state.reset_history();
@@ -1760,32 +2113,38 @@ impl Scratchpad {
         }
     }
 
-    /// Deletes the grapheme before the active field's caret.
+    /// Deletes the selection, or the grapheme before the field's caret.
     fn backspace_find(&mut self, cx: &mut Context<Self>) {
         let (deletion, editing_find) = {
             let Some(state) = &self.find else {
                 return;
             };
             let text = state.active();
-            let caret = snap_boundary(text, state.caret());
-            let previous = if caret == 0 {
-                None
+            let (sel_start, sel_end) = state.selection();
+            let (start, end) = if sel_start != sel_end {
+                (sel_start, sel_end)
             } else {
-                Some(previous_grapheme_start(text, caret))
+                let caret = snap_boundary(text, state.caret());
+                if caret == 0 {
+                    (0, 0)
+                } else {
+                    (previous_grapheme_start(text, caret), caret)
+                }
             };
             (
-                previous.map(|previous| (previous, caret)),
+                if start < end { Some((start, end)) } else { None },
                 state.field == FindField::Find,
             )
         };
 
-        let Some((previous, caret)) = deletion else {
+        let Some((start, end)) = deletion else {
             cx.notify();
             return;
         };
         if let Some(state) = &mut self.find {
-            state.active_mut().replace_range(previous..caret, "");
-            state.set_caret(previous);
+            state.active_mut().replace_range(start..end, "");
+            state.set_caret(start);
+            state.set_anchor(start);
             if editing_find {
                 state.reset_history();
             }
@@ -1797,32 +2156,38 @@ impl Scratchpad {
         }
     }
 
-    /// Deletes the grapheme after the active field's caret.
+    /// Deletes the selection, or the grapheme after the field's caret.
     fn delete_forward_find(&mut self, cx: &mut Context<Self>) {
         let (deletion, editing_find) = {
             let Some(state) = &self.find else {
                 return;
             };
             let text = state.active();
-            let caret = snap_boundary(text, state.caret());
-            let next = if caret >= text.len() {
-                None
+            let (sel_start, sel_end) = state.selection();
+            let (start, end) = if sel_start != sel_end {
+                (sel_start, sel_end)
             } else {
-                Some(next_grapheme_end(text, caret))
+                let caret = snap_boundary(text, state.caret());
+                if caret >= text.len() {
+                    (0, 0)
+                } else {
+                    (caret, next_grapheme_end(text, caret))
+                }
             };
             (
-                next.map(|next| (caret, next)),
+                if start < end { Some((start, end)) } else { None },
                 state.field == FindField::Find,
             )
         };
 
-        let Some((caret, next)) = deletion else {
+        let Some((start, end)) = deletion else {
             cx.notify();
             return;
         };
         if let Some(state) = &mut self.find {
-            state.active_mut().replace_range(caret..next, "");
-            state.set_caret(caret);
+            state.active_mut().replace_range(start..end, "");
+            state.set_caret(start);
+            state.set_anchor(start);
             if editing_find {
                 state.reset_history();
             }
@@ -1834,35 +2199,273 @@ impl Scratchpad {
         }
     }
 
-    /// Moves the active field's caret one grapheme left or right.
-    fn move_find_caret(&mut self, forward: bool, cx: &mut Context<Self>) {
+    /// Moves the active field's caret one grapheme left or right. With `extend`
+    /// the anchor stays put (growing a selection); without it a selection
+    /// collapses to its forward/backward edge.
+    fn move_find_caret(&mut self, forward: bool, extend: bool, cx: &mut Context<Self>) {
         let Some(state) = &mut self.find else {
             return;
         };
+        let (sel_start, sel_end) = state.selection();
         let target = {
             let text = state.active();
             let caret = snap_boundary(text, state.caret());
-            if forward {
+            if !extend && sel_start != sel_end {
+                if forward { sel_end } else { sel_start }
+            } else if forward {
                 next_grapheme_end(text, caret)
             } else {
                 previous_grapheme_start(text, caret)
             }
         };
         state.set_caret(target);
+        if !extend {
+            state.set_anchor(target);
+        }
         cx.notify();
     }
 
-    fn move_find_caret_home(&mut self, cx: &mut Context<Self>) {
+    fn move_find_caret_home(&mut self, extend: bool, cx: &mut Context<Self>) {
         if let Some(state) = &mut self.find {
             state.set_caret(0);
+            if !extend {
+                state.set_anchor(0);
+            }
             cx.notify();
         }
     }
 
-    fn move_find_caret_end(&mut self, cx: &mut Context<Self>) {
+    fn move_find_caret_end(&mut self, extend: bool, cx: &mut Context<Self>) {
         if let Some(state) = &mut self.find {
             let end = state.active().len();
             state.set_caret(end);
+            if !extend {
+                state.set_anchor(end);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Ctrl/Cmd+A: select the whole active field.
+    fn select_all_find(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.find {
+            let end = state.active().len();
+            state.set_anchor(0);
+            state.set_caret(end);
+            cx.notify();
+        }
+    }
+
+    /// Scrolls the active field horizontally just enough to keep the caret in
+    /// view, clamped to the text extent. Returns `false` until the field has
+    /// been laid out (the visible width comes from the recorded bounds).
+    fn ensure_find_caret_visible(&mut self, window: &Window) -> bool {
+        let Some((field, scroll, next)) = (|| {
+            let state = self.find.as_ref()?;
+            let field = state.field;
+            let text = match field {
+                FindField::Find => &state.find,
+                FindField::Replace => &state.replace,
+            };
+            let caret = match field {
+                FindField::Find => state.find_caret,
+                FindField::Replace => state.replace_caret,
+            };
+            let bounds = match field {
+                FindField::Find => self.find_query_bounds.get(),
+                FindField::Replace => self.find_replace_bounds.get(),
+            }?;
+            let visible_width = (f32::from(bounds.size.width)
+                - FIND_FIELD_PADDING
+                - find_field_right_padding(field))
+                .max(0.0);
+            if visible_width <= 0.0 {
+                return None;
+            }
+            let layout = window
+                .text_system()
+                .layout_line(text, px(FIND_FIELD_TEXT_SIZE), &[find_field_run(text)], None);
+            let max_scroll = (f32::from(layout.width) - visible_width).max(0.0);
+            let caret_x = f32::from(layout.x_for_index(snap_boundary(text, caret)));
+            let scroll = match field {
+                FindField::Find => state.find_scroll,
+                FindField::Replace => state.replace_scroll,
+            };
+            let mut next = scroll;
+            if caret_x < next {
+                next = caret_x;
+            } else if caret_x > next + visible_width {
+                next = caret_x - visible_width;
+            }
+            next = next.clamp(0.0, max_scroll);
+            Some((field, scroll, next))
+        })() else {
+            return false;
+        };
+        if (next - scroll).abs() > 0.01 {
+            if let Some(state) = &mut self.find {
+                match field {
+                    FindField::Find => state.find_scroll = next,
+                    FindField::Replace => state.replace_scroll = next,
+                }
+            }
+        }
+        true
+    }
+
+    /// Wheel/trackpad panning inside a field. Vertical wheel deltas pan
+    /// horizontally too: the field is a single line, so there is nothing else
+    /// for the wheel to do there.
+    fn pan_find_scroll(
+        &mut self,
+        field: FindField,
+        event: &ScrollEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dx = match event.delta {
+            ScrollDelta::Pixels(delta) => {
+                if f32::from(delta.x) != 0.0 {
+                    f32::from(delta.x)
+                } else {
+                    f32::from(delta.y)
+                }
+            }
+            ScrollDelta::Lines(delta) => {
+                if delta.x != 0.0 {
+                    delta.x * FIND_SCROLL_LINE_PX
+                } else {
+                    delta.y * FIND_SCROLL_LINE_PX
+                }
+            }
+        };
+        if dx == 0.0 {
+            return;
+        }
+        let (scroll, max_scroll) = {
+            let Some(state) = &self.find else {
+                return;
+            };
+            let text = match field {
+                FindField::Find => &state.find,
+                FindField::Replace => &state.replace,
+            };
+            let bounds = match field {
+                FindField::Find => self.find_query_bounds.get(),
+                FindField::Replace => self.find_replace_bounds.get(),
+            };
+            let Some(bounds) = bounds else {
+                return;
+            };
+            let visible_width = (f32::from(bounds.size.width)
+                - FIND_FIELD_PADDING
+                - find_field_right_padding(field))
+                .max(0.0);
+            if visible_width <= 0.0 {
+                return;
+            }
+            let layout = window
+                .text_system()
+                .layout_line(text, px(FIND_FIELD_TEXT_SIZE), &[find_field_run(text)], None);
+            let max_scroll = (f32::from(layout.width) - visible_width).max(0.0);
+            let scroll = match field {
+                FindField::Find => state.find_scroll,
+                FindField::Replace => state.replace_scroll,
+            };
+            (scroll, max_scroll)
+        };
+        if let Some(state) = &mut self.find {
+            let next = (scroll + dx).clamp(0.0, max_scroll);
+            match field {
+                FindField::Find => state.find_scroll = next,
+                FindField::Replace => state.replace_scroll = next,
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Maps a window point to a byte index in a find/replace field, using the
+    /// field bounds recorded during paint.
+    fn find_index_for_point(
+        &self,
+        field: FindField,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> Option<usize> {
+        let bounds = match field {
+            FindField::Find => self.find_query_bounds.get()?,
+            FindField::Replace => self.find_replace_bounds.get()?,
+        };
+        let state = self.find.as_ref()?;
+        let text = match field {
+            FindField::Find => &state.find,
+            FindField::Replace => &state.replace,
+        };
+        let scroll = match field {
+            FindField::Find => state.find_scroll,
+            FindField::Replace => state.replace_scroll,
+        };
+        let left = f32::from(bounds.origin.x) + FIND_FIELD_PADDING;
+        // The text is shifted left by the pan offset, so add it back when
+        // mapping a screen x back into text space. Negative values (a click in
+        // the left padding, or dragging past the edge) map to the text start
+        // inside `closest_index_for_x`.
+        let relative = f32::from(position.x) - left + scroll;
+        Some(closest_index_for_x(text, px(relative), window))
+    }
+
+    /// Mouse down in a field: place the caret at the click and start a drag.
+    fn begin_find_drag(
+        &mut self,
+        field: FindField,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fallback = self.find.as_ref().map(|state| match field {
+            FindField::Find => state.find.len(),
+            FindField::Replace => state.replace.len(),
+        });
+        let index = self
+            .find_index_for_point(field, position, window)
+            .or(fallback);
+        if let Some(state) = &mut self.find {
+            state.field = field;
+            // Clicking into a field dismisses the Find history dropdown.
+            state.history_open = false;
+            if let Some(index) = index {
+                state.set_caret(index);
+                state.set_anchor(index);
+            }
+            state.field_drag = Some(field);
+        }
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Mouse move during a field drag: extend the selection to the pointer.
+    fn update_find_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.find.as_ref().and_then(|state| state.field_drag) else {
+            return;
+        };
+        if !event.dragging() {
+            if let Some(state) = &mut self.find {
+                state.field_drag = None;
+            }
+            return;
+        }
+        if let Some(index) = self.find_index_for_point(field, event.position, window) {
+            if let Some(state) = &mut self.find {
+                state.field = field;
+                state.set_caret(index);
+            }
+            window.notify_text_input_changed(&self.focus_handle);
             cx.notify();
         }
     }
@@ -1871,6 +2474,11 @@ impl Scratchpad {
     /// live-highlights the first match so the query previews results as it is
     /// typed. The view does not scroll here; `Enter` reveals the match.
     fn after_find_query_changed(&mut self, cx: &mut Context<Self>) {
+        // Any query change invalidates the open dropdown; the list would
+        // otherwise show stale entries while the live query has already moved on.
+        if let Some(state) = &mut self.find {
+            state.history_open = false;
+        }
         let from = self
             .find
             .as_ref()
@@ -2038,26 +2646,8 @@ impl Scratchpad {
         }
     }
 
-    fn replace_all_find(
-        &mut self,
-        in_selection: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn replace_all_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.record_find();
-        let (start, end) = if in_selection {
-            let Some((start, end)) = self.find.as_ref().and_then(|state| state.selection) else {
-                self.show_hint("Select text to replace within", cx);
-                return;
-            };
-            // The snapshot can drift if earlier replacements changed the text;
-            // clamp so slicing is always valid.
-            let start = self.document.clamp_boundary(start);
-            let end = self.document.clamp_boundary(end).max(start);
-            (start, end)
-        } else {
-            (0, self.document.len())
-        };
 
         if !self
             .find
@@ -2077,39 +2667,26 @@ impl Scratchpad {
             };
             // Cap the replacement so an expanding template is refused before
             // the document is mutated (the model enforces the same cap).
-            let max = MAX_DOCUMENT_BYTES.saturating_sub(self.document.len() - (end - start));
-            find::replace_all(
-                &self.document.text()[start..end],
-                matcher,
-                &state.replace,
-                max,
-            )
+            find::replace_all(self.document.text(), matcher, &state.replace, MAX_DOCUMENT_BYTES)
         };
 
         let Some(new_text) = outcome else {
             self.show_hint("Document limit reached (64 MB).", cx);
             return;
         };
-        if new_text.as_str() == &self.document.text()[start..end] {
+        if new_text.as_str() == self.document.text() {
             self.show_hint("No matches", cx);
             return;
         }
 
-        if self.replace_range(start, end, &new_text, window, cx) {
-            // Keep the replaced region selected (selection mode) or park the
-            // caret at the region start (whole document).
-            if in_selection {
-                self.document.select_range(start, start + new_text.len());
-            } else {
-                self.document.set_cursor(start, false);
-            }
+        let end = self.document.len();
+        if self.replace_range(0, end, &new_text, window, cx) {
+            // Park the caret at the start of the replacement.
+            self.document.set_cursor(0, false);
             self.caret_visible = true;
             if let Some(state) = &mut self.find {
                 state.current = None;
                 state.wrapped = false;
-                if in_selection {
-                    state.selection = Some((start, start + new_text.len()));
-                }
             }
             window.notify_text_selection_changed(&self.focus_handle);
             cx.notify();
@@ -2703,6 +3280,40 @@ impl Scratchpad {
         }
     }
 
+    // ---- Line endings ---------------------------------------------------
+
+    /// Opens the line-ending dialog, preselecting the current style. A `Mixed`
+    /// document preselects LF, since `Mixed` is not a conversion target.
+    fn open_line_ending_prompt(&mut self, cx: &mut Context<Self>) {
+        let current = self.document.line_ending();
+        let selected = if current == LineEnding::Mixed {
+            LineEnding::Lf
+        } else {
+            current
+        };
+        self.line_ending_prompt = Some(LineEndingPrompt { selected });
+        cx.notify();
+    }
+
+    /// Converts the whole document to `target`. O(1): the buffer is `\n`-only,
+    /// so this changes only the stored style (one undo step) and needs no size
+    /// check or confirmation.
+    fn apply_line_ending(&mut self, target: LineEnding, cx: &mut Context<Self>) {
+        self.line_ending_prompt = None;
+        if self.document.set_line_ending(target) {
+            // With line endings displayed, their escapes change every row's
+            // width, so the cached longest-line extent must be rescanned.
+            if self.show_line_endings {
+                self.content_width_dirty.set(true);
+            }
+            self.schedule_save(cx);
+            self.show_hint(format!("Line endings: {}", target.label()), cx);
+        } else {
+            self.show_hint(format!("Already {}", target.label()), cx);
+        }
+        cx.notify();
+    }
+
     fn begin_hex_panel_drag(
         &mut self,
         position: Point<Pixels>,
@@ -2747,7 +3358,6 @@ impl Scratchpad {
         &self,
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
-        cx: &App,
     ) -> Option<usize> {
         let index = self.hex_index.as_ref()?;
         // Ignore an index that predates the current text (an edit between the
@@ -2755,7 +3365,7 @@ impl Scratchpad {
         if self.hex_index_key.map(|key| key.0) != Some(self.document.revision()) {
             return None;
         }
-        let metrics = self.hex_metrics(cx);
+        let metrics = self.hex_metrics();
         let origin_x = f32::from(bounds.origin.x) + PAD;
         let origin_y = f32::from(bounds.origin.y) + PAD;
         let relative_x = f32::from(position.x) - origin_x;
@@ -2816,7 +3426,7 @@ impl Scratchpad {
         let Some(bounds) = self.hex_bounds.get() else {
             return;
         };
-        if let Some(offset) = self.hex_offset_for_point(event.position, bounds, cx) {
+        if let Some(offset) = self.hex_offset_for_point(event.position, bounds) {
             window.focus(&self.focus_handle, cx);
             self.document.set_cursor(offset, event.modifiers.shift);
             self.caret_visible = true;
@@ -2825,7 +3435,7 @@ impl Scratchpad {
         if event.click_count >= 2 {
             // Double-click a byte to edit it directly.
             self.hex_dragging = false;
-            if let Some(index) = self.hex_byte_index_for_point(event.position, bounds, cx) {
+            if let Some(index) = self.hex_byte_index_for_point(event.position, bounds) {
                 self.byte_edit = Some(ByteEdit {
                     offset: index,
                     value: String::new(),
@@ -2843,7 +3453,6 @@ impl Scratchpad {
         &self,
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
-        cx: &App,
     ) -> Option<usize> {
         let index = self.hex_index.as_ref()?;
         // Ignore an index that predates the current text; the next render
@@ -2851,7 +3460,7 @@ impl Scratchpad {
         if self.hex_index_key.map(|key| key.0) != Some(self.document.revision()) {
             return None;
         }
-        let metrics = self.hex_metrics(cx);
+        let metrics = self.hex_metrics();
         let origin_x = f32::from(bounds.origin.x) + PAD;
         let origin_y = f32::from(bounds.origin.y) + PAD;
         let relative_x = f32::from(position.x) - origin_x;
@@ -3141,7 +3750,7 @@ impl Scratchpad {
         let Some(bounds) = self.hex_bounds.get() else {
             return;
         };
-        let Some(offset) = self.hex_offset_for_point(event.position, bounds, cx) else {
+        let Some(offset) = self.hex_offset_for_point(event.position, bounds) else {
             return;
         };
         if offset != self.document.cursor() {
@@ -3169,14 +3778,24 @@ impl Scratchpad {
                 let (_, line_end) = self.document.line_range(line);
                 let sel_start = selection_start.max(start).min(end);
                 let sel_end = selection_end.min(end).max(start);
+                // When line endings are shown the newline glyph lives on the row
+                // whose range includes it (`end` is one past `line_end`);
+                // otherwise it belongs to the last content row (`end == line_end`).
+                let last_row_of_line = if self.show_line_endings {
+                    end > line_end
+                } else {
+                    end == line_end
+                };
                 let newline_selected =
-                    end == line_end && selection_end > line_end && selection_start <= line_end;
+                    last_row_of_line && selection_end > line_end && selection_start <= line_end;
                 if sel_start == sel_end && !newline_selected {
                     continue;
                 }
                 let x0 = f32::from(self.x_in_row(start, sel_start, cx));
                 let mut x1 = f32::from(self.x_in_row(start, sel_end, cx));
-                if newline_selected {
+                if newline_selected && !self.show_line_endings {
+                    // Without a drawn line-ending glyph, mark the selection with
+                    // one cell so it stays visible.
                     x1 += f32::from(self.metrics.ascii_width);
                 }
                 if x1 <= x0 {
@@ -3218,7 +3837,7 @@ impl Scratchpad {
         hex_viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let metrics = self.hex_metrics(cx);
+        let metrics = self.hex_metrics();
         let line_height = metrics.line_height;
         // Highlight the byte currently open in the inline editor so the cell
         // being changed stays visually tied to the "Edit byte" dialog.
@@ -3521,10 +4140,15 @@ impl EntityInputHandler for Scratchpad {
         if let Some(state) = &self.find {
             let text = state.active();
             let caret = snap_boundary(text, state.caret());
-            let caret = utf16_offset(text, caret);
+            let anchor = snap_boundary(text, state.anchor());
+            let (start, end) = if caret <= anchor {
+                (caret, anchor)
+            } else {
+                (anchor, caret)
+            };
             return Some(UTF16Selection {
-                range: caret..caret,
-                reversed: false,
+                range: utf16_offset(text, start)..utf16_offset(text, end),
+                reversed: caret < anchor,
             });
         }
         if let Some(palette) = &self.palette {
@@ -3562,6 +4186,10 @@ impl EntityInputHandler for Scratchpad {
         if self.encoding_prompt.is_some() {
             return;
         }
+        // The line-ending dialog is modal; ignore IME/paste input while it is up.
+        if self.line_ending_prompt.is_some() {
+            return;
+        }
         // The transform confirmation is modal; ignore input while it is up.
         if self.pending_transform.is_some() {
             return;
@@ -3587,19 +4215,21 @@ impl EntityInputHandler for Scratchpad {
                     return;
                 };
                 let field_text = state.active();
-                let caret = snap_boundary(field_text, state.caret());
                 let (start, end) = match replacement_range {
                     Some(range) => (
                         byte_offset_for_utf16(field_text, range.start),
                         byte_offset_for_utf16(field_text, range.end),
                     ),
-                    None => (caret, caret),
+                    None => state.selection(),
                 };
                 let len = field_text.len();
                 let start = start.min(len);
                 let end = end.min(len).max(start);
-                state.active_mut().replace_range(start..end, text);
-                state.set_caret(start + text.len());
+                let insert = field_input(text);
+                state.active_mut().replace_range(start..end, &insert);
+                let caret = start + insert.len();
+                state.set_caret(caret);
+                state.set_anchor(caret);
                 let editing_find = state.field == FindField::Find;
                 if editing_find {
                     state.reset_history();
@@ -3712,6 +4342,13 @@ impl Render for Scratchpad {
         self.metrics.line_height = window.pixel_snap(self.metrics.line_height);
         self.hex_line_height
             .set(f32::from(window.pixel_snap(px(self.hex_line_height.get()))));
+        // The hex row is a flex sequence of per-cell widths and margins. If the
+        // advance stays fractional, gpui snaps each element independently and
+        // the painted cell origin creeps away from `offset + column * step`
+        // used by hit-testing; double-clicking a cell then misses its byte. Snap
+        // the advance here so layout and hit-testing share one pixel grid.
+        self.hex_ascii_width
+            .set(f32::from(window.pixel_snap(px(self.hex_ascii_advance(cx)))));
 
         let viewport = window.viewport_size();
         let viewport_width = f32::from(viewport.width);
@@ -3757,7 +4394,7 @@ impl Render for Scratchpad {
         // the same index. It must exist before the scroll sync below, which maps
         // text offsets to hex rows.
         let hex_bytes = if self.hex_panel {
-            hex_bytes_per_row(panel_width, &self.hex_metrics(cx))
+            hex_bytes_per_row(panel_width, &self.hex_metrics())
         } else {
             1
         };
@@ -4092,6 +4729,21 @@ impl Render for Scratchpad {
                             .px(px(6.0))
                             .py(px(2.0))
                             .text_size(px(12.0))
+                            // Neutral label; clicking opens the conversion dialog.
+                            .text_color(rgb(0xa6adc8))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.open_line_ending_prompt(cx);
+                                }),
+                            )
+                            .child(format!("EOL: {}", self.document.line_ending().label())),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_size(px(12.0))
                             .text_color(if self.word_wrap {
                                 rgb(0xa6adc8)
                             } else {
@@ -4321,11 +4973,31 @@ impl Render for Scratchpad {
                 )
         });
 
+        // Scroll the active field's caret into view only when the caret or text
+        // changed since the last frame that did so; a manual wheel pan must not
+        // be snapped back by the caret blink.
+        let scroll_key = self
+            .find
+            .as_ref()
+            .map(|state| (state.field, state.caret(), state.active().len()));
+        if let Some(key) = scroll_key {
+            if self.find_scroll_key != Some(key) && self.ensure_find_caret_visible(window) {
+                self.find_scroll_key = Some(key);
+            }
+        }
+
         let find_overlay = self.find.as_ref().map(|state| {
             let field = state.field;
-            let find_display = field_display(&state.find, state.find_caret, field == FindField::Find);
-            let replace_display =
-                field_display(&state.replace, state.replace_caret, field == FindField::Replace);
+            let find_active = field == FindField::Find;
+            let replace_active = field == FindField::Replace;
+            let find_text = state.find.clone();
+            let find_caret = state.find_caret;
+            let find_anchor = state.find_anchor;
+            let replace_text = state.replace.clone();
+            let replace_caret = state.replace_caret;
+            let replace_anchor = state.replace_anchor;
+            let history_open = state.history_open;
+            let recent_finds = self.recent_finds.clone();
 
             let (status_text, status_color) = if let Some(error) = &state.error {
                 (format!("Invalid regex: {error}"), rgb(0xf38ba8))
@@ -4340,49 +5012,256 @@ impl Render for Scratchpad {
             };
 
             let has_matcher = state.matcher.is_some();
-            // Use the snapshot, not the live selection: find navigation moves
-            // the live selection onto the current match.
-            let has_selection = state.selection.is_some();
 
+            let find_scroll = state.find_scroll;
+            let replace_scroll = state.replace_scroll;
+            let (find_more_left, find_more_right) = find_field_overflow(
+                &find_text,
+                find_scroll,
+                self.find_query_bounds.get(),
+                FIND_FIELD_RIGHT_PADDING,
+                window,
+            );
+            let (replace_more_left, replace_more_right) = find_field_overflow(
+                &replace_text,
+                replace_scroll,
+                self.find_replace_bounds.get(),
+                FIND_FIELD_PADDING,
+                window,
+            );
+
+            let ellipsis_patch = |left: bool, right_padding: f32| {
+                let patch = div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .w(px(FIND_OVERFLOW_PATCH_WIDTH))
+                    .bg(rgb(0x313244))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(FIND_FIELD_TEXT_SIZE))
+                    .text_color(rgb(0x6c7086))
+                    .child("…");
+                if left {
+                    patch.left(px(FIND_FIELD_PADDING))
+                } else {
+                    patch.right(px(right_padding))
+                }
+            };
+
+            let history_chevron = div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(FIND_HISTORY_ARROW_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .id("find-history-toggle")
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_find_history(window, cx);
+                }))
+                .child(
+                    svg()
+                        .data(CHEVRON_DOWN_SVG.as_bytes())
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(rgb(0xa6adc8)),
+                );
+
+            let find_bounds = self.find_query_bounds.clone();
             let find_field = div()
+                .relative()
+                .ml(px(FIND_FIELD_PADDING))
                 .flex_1()
+                .min_w_0()
                 .overflow_hidden()
-                .ml(px(6.0))
-                .px(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .whitespace_nowrap()
+                .min_h(px(FIND_FIELD_MIN_HEIGHT))
+                .pl(px(FIND_FIELD_PADDING))
+                .pr(px(FIND_FIELD_RIGHT_PADDING))
                 .py(px(4.0))
                 .bg(rgb(0x313244))
+                .font(font(".SystemUIFont"))
+                .text_size(px(FIND_FIELD_TEXT_SIZE))
                 .text_color(rgb(0xf5e0dc))
                 .id("find-query-field")
-                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    if let Some(state) = &mut this.find {
-                        let end = state.find.len();
-                        state.field = FindField::Find;
-                        state.find_caret = end;
-                    }
-                    window.notify_text_input_changed(&this.focus_handle);
-                    cx.notify();
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_find_drag(FindField::Find, event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
+                    this.pan_find_scroll(FindField::Find, event, window, cx);
                 }))
-                .child(find_display);
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .ml(px(-find_scroll))
+                                .whitespace_nowrap()
+                                .child(find_text.clone()),
+                        ),
+                )
+                .children(if find_more_left {
+                    Some(ellipsis_patch(true, FIND_FIELD_RIGHT_PADDING))
+                } else {
+                    None
+                })
+                .children(if find_more_right {
+                    Some(ellipsis_patch(false, FIND_FIELD_RIGHT_PADDING))
+                } else {
+                    None
+                })
+                .children(if recent_finds.is_empty() {
+                    None
+                } else {
+                    Some(history_chevron)
+                })
+                .child(
+                    canvas(
+                        move |_bounds, _window, _cx| {},
+                        move |bounds, _state, window, _cx| {
+                            find_bounds.set(Some(bounds));
+                            paint_find_field_overlay(
+                                bounds,
+                                &find_text,
+                                find_caret,
+                                find_anchor,
+                                find_scroll,
+                                FIND_FIELD_RIGHT_PADDING,
+                                find_active,
+                                window,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
 
+            let replace_bounds = self.find_replace_bounds.clone();
             let replace_field = div()
+                .relative()
+                .ml(px(FIND_FIELD_PADDING))
                 .flex_1()
+                .min_w_0()
                 .overflow_hidden()
-                .ml(px(6.0))
-                .px(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .whitespace_nowrap()
+                .min_h(px(FIND_FIELD_MIN_HEIGHT))
+                .px(px(FIND_FIELD_PADDING))
                 .py(px(4.0))
                 .bg(rgb(0x313244))
+                .font(font(".SystemUIFont"))
+                .text_size(px(FIND_FIELD_TEXT_SIZE))
                 .text_color(rgb(0xf5e0dc))
                 .id("find-replace-field")
-                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    if let Some(state) = &mut this.find {
-                        let end = state.replace.len();
-                        state.field = FindField::Replace;
-                        state.replace_caret = end;
-                    }
-                    window.notify_text_input_changed(&this.focus_handle);
-                    cx.notify();
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_find_drag(FindField::Replace, event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
+                    this.pan_find_scroll(FindField::Replace, event, window, cx);
                 }))
-                .child(replace_display);
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .ml(px(-replace_scroll))
+                                .whitespace_nowrap()
+                                .child(replace_text.clone()),
+                        ),
+                )
+                .children(if replace_more_left {
+                    Some(ellipsis_patch(true, FIND_FIELD_PADDING))
+                } else {
+                    None
+                })
+                .children(if replace_more_right {
+                    Some(ellipsis_patch(false, FIND_FIELD_PADDING))
+                } else {
+                    None
+                })
+                .child(
+                    canvas(
+                        move |_bounds, _window, _cx| {},
+                        move |bounds, _state, window, _cx| {
+                            replace_bounds.set(Some(bounds));
+                            paint_find_field_overlay(
+                                bounds,
+                                &replace_text,
+                                replace_caret,
+                                replace_anchor,
+                                replace_scroll,
+                                FIND_FIELD_PADDING,
+                                replace_active,
+                                window,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+
+            let mut history_items = Vec::new();
+            for (index, query) in recent_finds.iter().cloned().enumerate() {
+                let item = div()
+                    .w_full()
+                    .mb(px(1.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xf5e0dc))
+                    .bg(rgb(0x313244))
+                    .truncate()
+                    .id(("find-history-item", index))
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.select_find_history(index, cx);
+                    }))
+                    .child(query);
+                history_items.push(item.into_any_element());
+            }
+            let history_list = div()
+                .id("find-history-list")
+                .mt(px(4.0))
+                // Start under the find field: label + wrapper inset (the arrow
+                // now sits to the right of the field).
+                .ml(px(FIND_LABEL_WIDTH + FIND_FIELD_PADDING))
+                .bg(rgb(0x181825))
+                .flex()
+                .flex_col()
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .children(history_items);
 
             let regex_toggle = div()
                 .ml(px(6.0))
@@ -4427,11 +5306,6 @@ impl Render for Scratchpad {
                 .child("Aa");
 
             let action_color = if has_matcher {
-                rgb(0xcdd6f4)
-            } else {
-                rgb(0x585b70)
-            };
-            let selection_color = if has_matcher && has_selection {
                 rgb(0xcdd6f4)
             } else {
                 rgb(0x585b70)
@@ -4484,22 +5358,9 @@ impl Render for Scratchpad {
                 .bg(rgb(0x313244))
                 .id("find-replace-all")
                 .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    this.replace_all_find(false, window, cx);
+                    this.replace_all_find(window, cx);
                 }))
                 .child("Replace all");
-
-            let replace_selection_button = div()
-                .ml(px(6.0))
-                .px(px(8.0))
-                .py(px(3.0))
-                .text_size(px(12.0))
-                .text_color(selection_color)
-                .bg(rgb(0x313244))
-                .id("find-replace-selection")
-                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    this.replace_all_find(true, window, cx);
-                }))
-                .child("All in selection");
 
             div()
                 .absolute()
@@ -4533,16 +5394,39 @@ impl Render for Scratchpad {
                                 cx.stop_propagation();
                             }),
                         )
+                        .on_mouse_move(cx.listener(
+                            |this, event: &MouseMoveEvent, window, cx| {
+                                this.update_find_drag(event, window, cx);
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                                if let Some(state) = &mut this.find {
+                                    state.field_drag = None;
+                                }
+                            }),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .child(div().w(px(56.0)).text_color(rgb(0x6c7086)).child("Find"))
+                                .child(
+                                    div()
+                                        .w(px(FIND_LABEL_WIDTH))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Find"),
+                                )
                                 .child(find_field)
                                 .child(regex_toggle)
                                 .child(case_toggle),
                         )
+                        .children(if history_open && !recent_finds.is_empty() {
+                            Some(history_list)
+                        } else {
+                            None
+                        })
                         .child(
                             div()
                                 .mt(px(6.0))
@@ -4550,7 +5434,10 @@ impl Render for Scratchpad {
                                 .flex_row()
                                 .items_center()
                                 .child(
-                                    div().w(px(56.0)).text_color(rgb(0x6c7086)).child("Replace"),
+                                    div()
+                                        .w(px(FIND_LABEL_WIDTH))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Replace"),
                                 )
                                 .child(replace_field),
                         )
@@ -4564,7 +5451,6 @@ impl Render for Scratchpad {
                                 .child(next_button)
                                 .child(replace_button)
                                 .child(replace_all_button)
-                                .child(replace_selection_button)
                                 .child(
                                     div()
                                         .flex_1()
@@ -4574,7 +5460,7 @@ impl Render for Scratchpad {
                                         .child(status_text),
                                 ),
                         )
-                        .children(if self.recent_finds.is_empty() {
+                        .children(if recent_finds.is_empty() {
                             None
                         } else {
                             Some(
@@ -4584,8 +5470,8 @@ impl Render for Scratchpad {
                                     .text_color(rgb(0x6c7086))
                                     .child(format!(
                                         "Up/Down: {} recent find{}",
-                                        self.recent_finds.len(),
-                                        if self.recent_finds.len() == 1 { "" } else { "s" },
+                                        recent_finds.len(),
+                                        if recent_finds.len() == 1 { "" } else { "s" },
                                     )),
                             )
                         }),
@@ -4721,6 +5607,162 @@ impl Render for Scratchpad {
                                     }),
                                 )
                                 .child("Cancel"),
+                        ),
+                )
+        });
+
+        let line_ending_overlay = self.line_ending_prompt.as_ref().map(|prompt| {
+            let selected = prompt.selected;
+            let current = self.document.line_ending();
+            let show_line_endings = self.show_line_endings;
+
+            let mut options: Vec<AnyElement> = Vec::new();
+            for &style in LineEnding::TARGETS {
+                let is_selected = style == selected;
+                let item = div()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(if is_selected {
+                        rgb(0xcdd6f4)
+                    } else {
+                        rgb(0xa6adc8)
+                    })
+                    .bg(if is_selected {
+                        rgb(0x313244)
+                    } else {
+                        rgb(0x1e1e2e)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            if let Some(prompt) = &mut this.line_ending_prompt {
+                                prompt.selected = style;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(style.label());
+                options.push(item.into_any_element());
+            }
+
+            // Mirrors the status-bar "Invisibles" toggle: when on, each newline
+            // is drawn as its style's escape sequence.
+            let display_toggle = div()
+                .mt(px(10.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .text_size(px(13.0))
+                .text_color(rgb(0xcdd6f4))
+                .bg(rgb(0x313244))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.show_line_endings = !this.show_line_endings;
+                        // Escape widths change, so the longest-line extent must
+                        // be rescanned.
+                        this.content_width_dirty.set(true);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(format!(
+                    "Display line endings: {}",
+                    if show_line_endings { "on" } else { "off" }
+                ));
+
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        // Backdrop click cancels, like Esc and the Cancel button.
+                        this.line_ending_prompt = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(460.0))
+                        .p(px(12.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        // Keep clicks on the dialog's own background from
+                        // bubbling to the backdrop's cancel handler.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .pb(px(6.0))
+                                .text_color(rgb(0xf5e0dc))
+                                .child("Line endings"),
+                        )
+                        .children((current == LineEnding::Mixed).then(|| {
+                            div()
+                                .pb(px(6.0))
+                                .text_size(px(12.0))
+                                .text_color(rgb(0xf9e2af))
+                                .child(
+                                    "Mixed endings detected; converting replaces all line endings.",
+                                )
+                                .into_any_element()
+                        }))
+                        .children(options)
+                        .child(display_toggle)
+                        .child(
+                            div()
+                                .mt(px(10.0))
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x11111b))
+                                        .bg(rgb(0x94e2d5))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.apply_line_ending(selected, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child("Convert"),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x6c7086))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.line_ending_prompt = None;
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("Cancel"),
+                                ),
                         ),
                 )
         });
@@ -5040,6 +6082,7 @@ impl Render for Scratchpad {
             .children(palette_overlay)
             .children(find_overlay)
             .children(encoding_overlay)
+            .children(line_ending_overlay)
             .children(byte_edit_overlay)
             .children(jump_overlay)
             .children(pending_overlay)
