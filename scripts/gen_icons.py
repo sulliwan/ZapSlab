@@ -6,10 +6,10 @@ upscaled with nearest-neighbour sampling so the hard pixel edges stay crisp;
 non-integer multiples (the 180px Apple icon) are rendered at the next integer
 scale and then resampled down so no row of pixels is wider than its neighbour.
 
-Every icon is flattened onto the theme background (#11111b, the manifest's
-`background_color`) and saved as an opaque RGB PNG: iOS paints transparent
-pixels black, and an opaque icon looks the same in every launcher instead of
-picking up whatever backdrop the OS uses.
+`icon-192`/`icon-512` keep the artwork's transparency. The Apple touch icon and
+the maskable variant are flattened onto the theme background (#11111b, the
+manifest's `background_color`) because iOS paints transparent pixels black and
+Android maskable icons must be full-bleed.
 
 Requires Pillow (`python3 -m pip install --user pillow`).
 """
@@ -23,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "scripts" / "zapslab-icon-64.png"
 OUT = ROOT / "web" / "icons"
 
-BACKGROUND = (17, 17, 27, 255)  # #11111b, matches manifest background_color
+BACKGROUND = (17, 17, 27)  # #11111b, matches manifest background_color
 # Maskable icons must keep their content inside the central 80% safe circle.
 MASKABLE_SAFE_FRACTION = 0.8
 
@@ -37,16 +37,8 @@ def load_source() -> Image.Image:
     return img
 
 
-def _on_background(mark: Image.Image, size: int) -> Image.Image:
-    canvas = Image.new("RGBA", (size, size), BACKGROUND)
-    canvas.alpha_composite(
-        mark, ((size - mark.width) // 2, (size - mark.height) // 2)
-    )
-    return canvas
-
-
-def icon(src: Image.Image, size: int) -> Image.Image:
-    """Full-bleed icon: the artwork fills the canvas, bar its own margins."""
+def _resize(src: Image.Image, size: int) -> Image.Image:
+    """Upscale the artwork to exactly `size` px, preserving alpha."""
     # Integer scale up, then (only when the size is not a multiple) downsample
     # to the exact size. Upscaling straight to a fractional size with NEAREST
     # would give neighbouring pixels different widths.
@@ -54,7 +46,26 @@ def icon(src: Image.Image, size: int) -> Image.Image:
     mark = src.resize((src.width * scale, src.height * scale), Image.NEAREST)
     if mark.width != size:
         mark = mark.resize((size, size), Image.LANCZOS)
-    return _on_background(mark, size)
+    return mark
+
+
+def _flatten(mark: Image.Image, size: int) -> Image.Image:
+    """Center `mark` on an opaque theme-colored `size` square."""
+    canvas = Image.new("RGBA", (size, size), BACKGROUND + (255,))
+    canvas.alpha_composite(
+        mark, ((size - mark.width) // 2, (size - mark.height) // 2)
+    )
+    return canvas.convert("RGB")
+
+
+def icon(src: Image.Image, size: int) -> Image.Image:
+    """Full-bleed icon: the artwork fills the canvas, bar its own margins."""
+    return _resize(src, size)
+
+
+def _opaque_icon(src: Image.Image, size: int) -> Image.Image:
+    """Icon flattened onto the background, for platforms that drop alpha."""
+    return _flatten(_resize(src, size), size)
 
 
 def maskable(src: Image.Image, size: int) -> Image.Image:
@@ -66,7 +77,7 @@ def maskable(src: Image.Image, size: int) -> Image.Image:
     radius = size * MASKABLE_SAFE_FRACTION / 2
     scale = max(1, int(radius / half_diagonal))
     mark = src.resize((src.width * scale, src.height * scale), Image.NEAREST)
-    return _on_background(mark, size)
+    return _flatten(mark, size)
 
 
 def main() -> None:
@@ -76,12 +87,14 @@ def main() -> None:
         "icon-192.png": icon(src, 192),
         "icon-512.png": icon(src, 512),
         "maskable-512.png": maskable(src, 512),
-        "apple-touch-icon.png": icon(src, 180),
+        "apple-touch-icon.png": _opaque_icon(src, 180),
     }
     for name, img in icons.items():
         path = OUT / name
-        img.convert("RGB").save(path, "PNG", optimize=True)
-        print(f"wrote {path.relative_to(ROOT)} ({img.width}x{img.height})")
+        img.save(path, "PNG", optimize=True)
+        print(
+            f"wrote {path.relative_to(ROOT)} ({img.width}x{img.height} {img.mode})"
+        )
 
 
 if __name__ == "__main__":

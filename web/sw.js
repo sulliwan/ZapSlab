@@ -3,7 +3,7 @@
 // is picked up even without a VERSION bump; bumping VERSION still purges the
 // old cache of the remaining assets on activate.
 
-const VERSION = "zapslab-v2";
+const VERSION = "zapslab-v3";
 const SHELL = [
   "/",
   "/index.html",
