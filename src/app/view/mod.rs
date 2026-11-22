@@ -7,6 +7,8 @@ mod find;
 pub(crate) mod geom;
 mod hex;
 mod mouse;
+mod overlays;
 mod paint;
 mod palette;
 mod scroll;
+mod status;

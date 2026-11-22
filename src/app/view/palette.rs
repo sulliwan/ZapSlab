@@ -233,3 +233,159 @@ impl Scratchpad {
         self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 }
+
+impl Scratchpad {
+    pub(crate) fn palette_overlay(
+        &self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let palette_overlay = self.palette.as_ref().map(|palette| {
+            let matches = self.palette_matches();
+            let (sel_start, sel_end) = self.document.selection_range();
+            let has_selection = sel_start != sel_end;
+            // Leave room for the 80px top offset, the query line, and padding
+            // so the list never extends past the window.
+            let list_max_height = (f32::from(viewport.height) - 80.0 - 56.0).max(120.0);
+            let mut items: Vec<AnyElement> = Vec::new();
+            let selected_index = palette.selected.min(matches.len().saturating_sub(1));
+            if matches.is_empty() {
+                items.push(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_color(rgb(0x6c7086))
+                        .child("No matches")
+                        .into_any_element(),
+                );
+            }
+            for (position, entry) in matches.iter().enumerate() {
+                let (name, description, available) = match *entry {
+                    PaletteEntry::Transform(index) => {
+                        let transform = &transforms::TRANSFORMS[index];
+                        (
+                            transform.name,
+                            transform.description,
+                            transforms::is_available(transform, has_selection),
+                        )
+                    }
+                    PaletteEntry::Command(index) => {
+                        let command = &commands::COMMANDS[index];
+                        (command.name, command.description, true)
+                    }
+                };
+                let selected = position == selected_index;
+                let name_color = if !available {
+                    rgb(0x585b70)
+                } else if selected {
+                    rgb(0xcdd6f4)
+                } else {
+                    rgb(0xa6adc8)
+                };
+                let info_icon = div()
+                    .child("info")
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x6c7086))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .id(("palette-info", position))
+                    // Clicking the label must not also apply the entry.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                    )
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .tooltip(move |_window, cx| {
+                        cx.new(|_| PaletteTooltip { text: description }).into()
+                    });
+                let item = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_color(name_color)
+                    .child(name)
+                    .child(info_icon);
+                let item = if selected {
+                    item.bg(rgb(0x313244))
+                } else {
+                    item
+                };
+                let item = item.id(("palette-row", position)).on_click(cx.listener(
+                    move |this, _event: &ClickEvent, window, cx| {
+                        if let Some(palette) = &mut this.palette {
+                            palette.selected = position;
+                        }
+                        this.apply_selected_palette_entry(window, cx);
+                    },
+                ));
+                items.push(item.into_any_element());
+            }
+
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                // Stop the hit test at the modal so the editor's scroll
+                // container behind it no longer receives wheel events (gpui's
+                // scroll hit-testing considers every hitbox under the pointer).
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        // Clicking the dimmed backdrop cancels, like Esc.
+                        this.palette = None;
+                        window.notify_text_input_changed(&this.focus_handle);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(440.0))
+                        .p(px(8.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        // Keep clicks on the dialog from bubbling to the
+                        // backdrop's cancel handler.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .text_color(rgb(0xf5e0dc))
+                                .child(format!("> {}\u{258F}", palette.query)),
+                        )
+                        .child(
+                            div()
+                                .id("zapslab-palette-scroll")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(list_max_height))
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.palette_scroll)
+                                .children(items),
+                        ),
+                )
+        });
+        palette_overlay.map(|element| element.into_any_element())
+    }
+}

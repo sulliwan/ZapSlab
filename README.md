@@ -17,5 +17,11 @@ You can install it as a PWA and use as a desktop app.
 **Q: Is this vibe-coded?**
 > A: Yes. Nearly all code is written by Deepseek 4.1 Flash. I provided directorial input and the icon.
 
+**Q: Is this secure?**
+> A: Probably? The WASM sandbox and Rust provide decent enough security guarantees. Maybe don't use this to process credit card PANs though. The local IndexedDB is not encrypted, so bad guys can steal your text buffer if you get pwned. I have plans to solve this with device-bound encryption keys at some point.
+
 **Q: Are mobile devices supported?**
-> A: No, not planned, but maybe?
+> A: No, not planned right now. Perhaps in the future, but unlikely.
+
+**Q: Are you accepting contributions?**
+> A: No, feel free to file bug reports or feature requests to Github issues.

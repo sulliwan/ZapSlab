@@ -1032,3 +1032,502 @@ impl Scratchpad {
         }
     }
 }
+
+impl Scratchpad {
+    pub(crate) fn find_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let find_overlay = self.find.as_ref().map(|state| {
+            let field = state.field;
+            let find_active = field == FindField::Find;
+            let replace_active = field == FindField::Replace;
+            let find_text = state.find.clone();
+            let find_caret = state.find_caret;
+            let find_anchor = state.find_anchor;
+            let replace_text = state.replace.clone();
+            let replace_caret = state.replace_caret;
+            let replace_anchor = state.replace_anchor;
+            let history_open = state.history_open;
+            let recent_finds = self.recent_finds.clone();
+
+            let (status_text, status_color) = if let Some(error) = &state.error {
+                (format!("Invalid regex: {error}"), rgb(0xf38ba8))
+            } else if state.matcher.is_none() {
+                (String::new(), rgb(0x6c7086))
+            } else if state.current.is_none() {
+                ("No matches".to_string(), rgb(0x6c7086))
+            } else if state.wrapped {
+                ("Wrapped".to_string(), rgb(0xf9e2af))
+            } else {
+                (String::new(), rgb(0x6c7086))
+            };
+
+            let has_matcher = state.matcher.is_some();
+
+            let find_scroll = state.find_scroll;
+            let replace_scroll = state.replace_scroll;
+            let (find_more_left, find_more_right) = find_field_overflow(
+                &find_text,
+                find_scroll,
+                self.find_query_bounds.get(),
+                FIND_FIELD_RIGHT_PADDING,
+                window,
+            );
+            let (replace_more_left, replace_more_right) = find_field_overflow(
+                &replace_text,
+                replace_scroll,
+                self.find_replace_bounds.get(),
+                FIND_FIELD_PADDING,
+                window,
+            );
+
+            let ellipsis_patch = |left: bool, right_padding: f32| {
+                let patch = div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .w(px(FIND_OVERFLOW_PATCH_WIDTH))
+                    .bg(rgb(0x313244))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(FIND_FIELD_TEXT_SIZE))
+                    .text_color(rgb(0x6c7086))
+                    .child("…");
+                if left {
+                    patch.left(px(FIND_FIELD_PADDING))
+                } else {
+                    patch.right(px(right_padding))
+                }
+            };
+
+            let history_chevron = div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(FIND_HISTORY_ARROW_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .id("find-history-toggle")
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_find_history(window, cx);
+                }))
+                .child(
+                    svg()
+                        .data(CHEVRON_DOWN_SVG.as_bytes())
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(rgb(0xa6adc8)),
+                );
+
+            let find_bounds = self.find_query_bounds.clone();
+            let find_field = div()
+                .relative()
+                .ml(px(FIND_FIELD_PADDING))
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .flex_row()
+                .items_center()
+                .whitespace_nowrap()
+                .min_h(px(FIND_FIELD_MIN_HEIGHT))
+                .pl(px(FIND_FIELD_PADDING))
+                .pr(px(FIND_FIELD_RIGHT_PADDING))
+                .py(px(4.0))
+                .bg(rgb(0x313244))
+                .font(font(".SystemUIFont"))
+                .text_size(px(FIND_FIELD_TEXT_SIZE))
+                .text_color(rgb(0xf5e0dc))
+                .id("find-query-field")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_find_drag(FindField::Find, event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
+                    this.pan_find_scroll(FindField::Find, event, window, cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .ml(px(-find_scroll))
+                                .whitespace_nowrap()
+                                .child(find_text.clone()),
+                        ),
+                )
+                .children(if find_more_left {
+                    Some(ellipsis_patch(true, FIND_FIELD_RIGHT_PADDING))
+                } else {
+                    None
+                })
+                .children(if find_more_right {
+                    Some(ellipsis_patch(false, FIND_FIELD_RIGHT_PADDING))
+                } else {
+                    None
+                })
+                .children(if recent_finds.is_empty() {
+                    None
+                } else {
+                    Some(history_chevron)
+                })
+                .child(
+                    canvas(
+                        move |_bounds, _window, _cx| {},
+                        move |bounds, _state, window, _cx| {
+                            find_bounds.set(Some(bounds));
+                            paint_find_field_overlay(
+                                bounds,
+                                &find_text,
+                                find_caret,
+                                find_anchor,
+                                find_scroll,
+                                FIND_FIELD_RIGHT_PADDING,
+                                find_active,
+                                window,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+
+            let replace_bounds = self.find_replace_bounds.clone();
+            let replace_field = div()
+                .relative()
+                .ml(px(FIND_FIELD_PADDING))
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .flex_row()
+                .items_center()
+                .whitespace_nowrap()
+                .min_h(px(FIND_FIELD_MIN_HEIGHT))
+                .px(px(FIND_FIELD_PADDING))
+                .py(px(4.0))
+                .bg(rgb(0x313244))
+                .font(font(".SystemUIFont"))
+                .text_size(px(FIND_FIELD_TEXT_SIZE))
+                .text_color(rgb(0xf5e0dc))
+                .id("find-replace-field")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_find_drag(FindField::Replace, event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
+                    this.pan_find_scroll(FindField::Replace, event, window, cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .ml(px(-replace_scroll))
+                                .whitespace_nowrap()
+                                .child(replace_text.clone()),
+                        ),
+                )
+                .children(if replace_more_left {
+                    Some(ellipsis_patch(true, FIND_FIELD_PADDING))
+                } else {
+                    None
+                })
+                .children(if replace_more_right {
+                    Some(ellipsis_patch(false, FIND_FIELD_PADDING))
+                } else {
+                    None
+                })
+                .child(
+                    canvas(
+                        move |_bounds, _window, _cx| {},
+                        move |bounds, _state, window, _cx| {
+                            replace_bounds.set(Some(bounds));
+                            paint_find_field_overlay(
+                                bounds,
+                                &replace_text,
+                                replace_caret,
+                                replace_anchor,
+                                replace_scroll,
+                                FIND_FIELD_PADDING,
+                                replace_active,
+                                window,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+
+            let mut history_items = Vec::new();
+            for (index, query) in recent_finds.iter().cloned().enumerate() {
+                let item = div()
+                    .w_full()
+                    .mb(px(1.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xf5e0dc))
+                    .bg(rgb(0x313244))
+                    .truncate()
+                    .id(("find-history-item", index))
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.select_find_history(index, cx);
+                    }))
+                    .child(query);
+                history_items.push(item.into_any_element());
+            }
+            let history_list = div()
+                .id("find-history-list")
+                .mt(px(4.0))
+                // Start under the find field: label width plus the field's left
+                // inset.
+                .ml(px(FIND_LABEL_WIDTH + FIND_FIELD_PADDING))
+                .bg(rgb(0x181825))
+                .flex()
+                .flex_col()
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .children(history_items);
+
+            let regex_toggle = div()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .text_size(px(12.0))
+                .text_color(if state.regex {
+                    rgb(0x11111b)
+                } else {
+                    rgb(0xa6adc8)
+                })
+                .bg(if state.regex {
+                    rgb(0x94e2d5)
+                } else {
+                    rgb(0x313244)
+                })
+                .id("find-regex-toggle")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_find_regex(cx);
+                }))
+                .child(".*");
+
+            let case_toggle = div()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .text_size(px(12.0))
+                .text_color(if state.case_insensitive {
+                    rgb(0x11111b)
+                } else {
+                    rgb(0xa6adc8)
+                })
+                .bg(if state.case_insensitive {
+                    rgb(0x94e2d5)
+                } else {
+                    rgb(0x313244)
+                })
+                .id("find-case-toggle")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_find_case_insensitive(cx);
+                }))
+                .child("Aa");
+
+            let action_color = if has_matcher {
+                rgb(0xcdd6f4)
+            } else {
+                rgb(0x585b70)
+            };
+
+            let prev_button = div()
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-prev")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.find_prev_match(window, cx);
+                }))
+                .child("Prev");
+
+            let next_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-next")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.find_next_match(window, cx);
+                }))
+                .child("Next");
+
+            let replace_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-replace-one")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.replace_current(window, cx);
+                }))
+                .child("Replace");
+
+            let replace_all_button = div()
+                .ml(px(6.0))
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .text_color(action_color)
+                .bg(rgb(0x313244))
+                .id("find-replace-all")
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.replace_all_find(window, cx);
+                }))
+                .child("Replace all");
+
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000066))
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.close_find(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(560.0))
+                        .p(px(10.0))
+                        .bg(rgb(0x1e1e2e))
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                            this.update_find_drag(event, window, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                                if let Some(state) = &mut this.find {
+                                    state.field_drag = None;
+                                }
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(FIND_LABEL_WIDTH))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Find"),
+                                )
+                                .child(find_field)
+                                .child(regex_toggle)
+                                .child(case_toggle),
+                        )
+                        .children(if history_open && !recent_finds.is_empty() {
+                            Some(history_list)
+                        } else {
+                            None
+                        })
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(FIND_LABEL_WIDTH))
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Replace"),
+                                )
+                                .child(replace_field),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(prev_button)
+                                .child(next_button)
+                                .child(replace_button)
+                                .child(replace_all_button)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .ml(px(8.0))
+                                        .text_size(px(12.0))
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                ),
+                        )
+                        .children(if recent_finds.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                div()
+                                    .mt(px(4.0))
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x6c7086))
+                                    .child(format!(
+                                        "Up/Down: {} recent find{}",
+                                        recent_finds.len(),
+                                        if recent_finds.len() == 1 { "" } else { "s" },
+                                    )),
+                            )
+                        }),
+                )
+        });
+        find_overlay.map(|element| element.into_any_element())
+    }
+}
