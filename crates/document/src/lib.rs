@@ -27,8 +27,8 @@ use std::{borrow::Cow, collections::VecDeque};
 use crate::grapheme::{next_grapheme_boundary, previous_grapheme_boundary, snap_to_grapheme};
 use crate::line_index::LineIndex;
 
-/// Maximum number of undo snapshots retained. Older snapshots are evicted
-/// from the front of the ring so the ends stay O(1).
+/// Maximum number of undo steps retained. Older steps are evicted from the
+/// front of the ring so the ends stay O(1).
 pub const MAX_UNDO: usize = 200;
 
 /// Hard cap on the document's UTF-8 byte length. Edits that would grow the
@@ -36,11 +36,29 @@ pub const MAX_UNDO: usize = 200;
 /// surfaces a message and refuses the input before it reaches the model.
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Cap on the bytes retained across undo steps (removed + inserted text). The
+/// oldest steps are evicted first, but at least one is always kept so the most
+/// recent edit stays undoable even if it alone exceeds the budget.
+pub const MAX_UNDO_BYTES: usize = 128 * 1024 * 1024;
+
+/// One reversible edit: undoing replaces `start..start + inserted.len()` with
+/// `removed`; redoing replaces `start..start + removed.len()` with `inserted`.
+/// Its size tracks what the user actually changed, not the document size.
 #[derive(Clone)]
-struct Snapshot {
-    text: String,
-    cursor: usize,
-    anchor: usize,
+struct Edit {
+    start: usize,
+    removed: String,
+    inserted: String,
+    /// Cursor/anchor to restore on undo. The post-edit caret is
+    /// `start + inserted.len()` (undo/redo always leave a plain caret).
+    before_cursor: usize,
+    before_anchor: usize,
+}
+
+impl Edit {
+    fn size(&self) -> usize {
+        self.removed.len() + self.inserted.len()
+    }
 }
 
 /// Tracks a run of contiguous single-character insertions so a typing burst
@@ -59,8 +77,11 @@ pub struct Document {
     /// Total UTF-16 code units in `text`, maintained incrementally so the
     /// platform-boundary conversions can walk from the nearer end.
     utf16_len: usize,
-    undo: VecDeque<Snapshot>,
-    redo: VecDeque<Snapshot>,
+    undo: VecDeque<Edit>,
+    redo: VecDeque<Edit>,
+    /// Retained bytes in `undo`/`redo`, for the `MAX_UNDO_BYTES` budget.
+    undo_bytes: usize,
+    redo_bytes: usize,
     insert_run: Option<InsertRun>,
     /// Bumped whenever the text changes. The view uses it to invalidate cached
     /// layout that depends on the document's contents (e.g. soft wrapping).
@@ -87,6 +108,8 @@ impl Document {
             utf16_len,
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
             insert_run: None,
             revision: 0,
         }
@@ -324,8 +347,8 @@ impl Document {
     /// Replaces `start..end` with `insert`. Returns whether the text changed.
     ///
     /// A run of contiguous single-character insertions (i.e. typing) collapses
-    /// into one undo step: only the first keystroke of the run pushes a
-    /// snapshot, and the snapshot captures the state before the run began.
+    /// into one undo step: only the first keystroke records an edit, and later
+    /// keystrokes append to its inserted text.
     pub fn replace_range(&mut self, start: usize, end: usize, insert: &str) -> bool {
         let start = self.clamp_boundary(start);
         let end = self.clamp_boundary(end.max(start));
@@ -347,12 +370,36 @@ impl Document {
             && self.cursor == start
             && self.anchor == start;
 
+        // Any successful edit invalidates the redo history.
+        self.redo.clear();
+        self.redo_bytes = 0;
+
         if coalesce {
+            // Extend the current typing run's inserted text.
+            if let Some(edit) = self.undo.back_mut() {
+                edit.inserted.push_str(inserted);
+                self.undo_bytes += inserted.len();
+            }
             if let Some(run) = &mut self.insert_run {
                 run.end = start + inserted.len();
             }
+            self.evict_undo();
         } else {
-            self.push_undo();
+            let removed = self.text[start..end].to_string();
+            if removed == inserted {
+                // Identical replacement: nothing to record or relayout.
+                self.insert_run = None;
+                self.cursor = start + inserted.len();
+                self.anchor = self.cursor;
+                return true;
+            }
+            self.push_edit(Edit {
+                start,
+                removed,
+                inserted: inserted.to_string(),
+                before_cursor: self.cursor,
+                before_anchor: self.anchor,
+            });
             self.insert_run = if single_char {
                 Some(InsertRun {
                     end: start + inserted.len(),
@@ -362,15 +409,9 @@ impl Document {
             };
         }
 
-        let removed_utf16 = self.text[start..end].encode_utf16().count();
-        let inserted_utf16 = inserted.encode_utf16().count();
-        self.text.replace_range(start..end, inserted);
+        self.apply_text_edit(start, end, inserted);
         self.cursor = start + inserted.len();
         self.anchor = self.cursor;
-        self.lines
-            .apply_edit(&self.text, start, end, inserted.len());
-        self.utf16_len = self.utf16_len - removed_utf16 + inserted_utf16;
-        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -405,59 +446,78 @@ impl Document {
 
     // ---- History --------------------------------------------------------
 
-    fn push_undo(&mut self) {
-        let unchanged = self.undo.back().is_some_and(|snapshot| {
-            snapshot.text == self.text
-                && snapshot.cursor == self.cursor
-                && snapshot.anchor == self.anchor
-        });
-        if !unchanged {
-            self.undo.push_back(Snapshot {
-                text: self.text.clone(),
-                cursor: self.cursor,
-                anchor: self.anchor,
-            });
-            if self.undo.len() > MAX_UNDO {
-                self.undo.pop_front();
-            }
+    /// Record a new undo step and evict old ones to stay within the count and
+    /// byte budgets.
+    fn push_edit(&mut self, edit: Edit) {
+        self.undo_bytes += edit.size();
+        self.undo.push_back(edit);
+        self.evict_undo();
+    }
+
+    fn evict_undo(&mut self) {
+        while self.undo.len() > MAX_UNDO
+            || (self.undo_bytes > MAX_UNDO_BYTES && self.undo.len() > 1)
+        {
+            let Some(front) = self.undo.pop_front() else {
+                break;
+            };
+            self.undo_bytes = self.undo_bytes.saturating_sub(front.size());
         }
-        self.redo.clear();
+    }
+
+    /// Apply a text replacement, keeping the line index, UTF-16 length, and
+    /// revision in sync. Does not touch history or the cursor.
+    fn apply_text_edit(&mut self, start: usize, end: usize, insert: &str) {
+        let removed_utf16 = self.text[start..end].encode_utf16().count();
+        let inserted_utf16 = insert.encode_utf16().count();
+        self.text.replace_range(start..end, insert);
+        self.lines.apply_edit(&self.text, start, end, insert.len());
+        self.utf16_len = self.utf16_len - removed_utf16 + inserted_utf16;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(snapshot) = self.undo.pop_back() else {
+        let Some(edit) = self.undo.pop_back() else {
             return false;
         };
-        self.redo.push_back(Snapshot {
-            text: self.text.clone(),
-            cursor: self.cursor,
-            anchor: self.anchor,
-        });
-        self.restore(snapshot);
+        self.undo_bytes = self.undo_bytes.saturating_sub(edit.size());
+
+        let inserted_len = edit.inserted.len();
+        debug_assert_eq!(
+            self.text.get(edit.start..edit.start + inserted_len),
+            Some(edit.inserted.as_str()),
+            "undo step does not match the current text"
+        );
+        self.apply_text_edit(edit.start, edit.start + inserted_len, &edit.removed);
+        self.cursor = self.clamp_boundary(edit.before_cursor);
+        self.anchor = self.clamp_boundary(edit.before_anchor);
+        self.insert_run = None;
+
+        self.redo_bytes += edit.size();
+        self.redo.push_back(edit);
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(snapshot) = self.redo.pop_back() else {
+        let Some(edit) = self.redo.pop_back() else {
             return false;
         };
-        self.undo.push_back(Snapshot {
-            text: self.text.clone(),
-            cursor: self.cursor,
-            anchor: self.anchor,
-        });
-        self.restore(snapshot);
-        true
-    }
+        self.redo_bytes = self.redo_bytes.saturating_sub(edit.size());
 
-    fn restore(&mut self, snapshot: Snapshot) {
-        self.text = snapshot.text;
-        self.cursor = self.clamp_boundary(snapshot.cursor);
-        self.anchor = self.clamp_boundary(snapshot.anchor);
+        let removed_len = edit.removed.len();
+        debug_assert_eq!(
+            self.text.get(edit.start..edit.start + removed_len),
+            Some(edit.removed.as_str()),
+            "redo step does not match the current text"
+        );
+        self.apply_text_edit(edit.start, edit.start + removed_len, &edit.inserted);
+        self.cursor = edit.start + edit.inserted.len();
+        self.anchor = self.cursor;
         self.insert_run = None;
-        self.lines = LineIndex::new(&self.text);
-        self.utf16_len = self.text.encode_utf16().count();
-        self.revision = self.revision.wrapping_add(1);
+
+        self.undo_bytes += edit.size();
+        self.undo.push_back(edit);
+        true
     }
 }
 
@@ -688,6 +748,69 @@ mod tests {
             undos += 1;
         }
         assert_eq!(undos, MAX_UNDO);
+    }
+
+    fn assert_undo_accounting(document: &Document) {
+        let undo_sum: usize = document.undo.iter().map(Edit::size).sum();
+        assert_eq!(document.undo_bytes, undo_sum);
+        let redo_sum: usize = document.redo.iter().map(Edit::size).sum();
+        assert_eq!(document.redo_bytes, redo_sum);
+    }
+
+    #[test]
+    fn undo_stores_only_the_edit_bytes() {
+        let mut document = doc(&"a".repeat(1_000_000));
+        // Move into the middle so this is not an append, then type one character.
+        document.set_cursor(500_000, false);
+        assert!(document.insert_text("b"));
+        let edit = document.undo.back().expect("one undo step");
+        assert_eq!(edit.size(), 1, "edit stored {} bytes", edit.size());
+    }
+
+    #[test]
+    fn undo_accounting_matches_retained_edits() {
+        let mut document = doc("abcdef");
+        assert_undo_accounting(&document);
+        document.select_all();
+        assert!(document.insert_text("X"));
+        assert_undo_accounting(&document);
+        document.set_cursor(1, false);
+        assert!(document.insert_text("hi"));
+        assert_undo_accounting(&document);
+        assert!(document.undo());
+        assert_undo_accounting(&document);
+        assert!(document.undo());
+        assert_undo_accounting(&document);
+        assert!(document.redo());
+        assert_undo_accounting(&document);
+    }
+
+    #[test]
+    fn undo_redo_round_trip_through_mixed_edits() {
+        let mut document = doc("hello world\nsecond line");
+        document.set_cursor(5, false);
+        assert!(document.insert_text(","));
+        assert!(document.replace_range(0, 1, "H"));
+        document.set_cursor(document.len(), false);
+        assert!(document.backspace());
+        let after = document.text().to_string();
+
+        while document.undo() {}
+        assert_eq!(document.text(), "hello world\nsecond line");
+
+        while document.redo() {}
+        assert_eq!(document.text(), after);
+    }
+
+    #[test]
+    fn editing_after_undo_clears_redo() {
+        let mut document = doc("");
+        assert!(document.insert_text("a"));
+        assert!(document.insert_text("bc"));
+        assert!(document.undo());
+        assert!(!document.redo.is_empty());
+        assert!(document.insert_text("d"));
+        assert!(document.redo.is_empty());
     }
 
     #[test]

@@ -30,7 +30,7 @@ crates/document/     standalone crate `zapslab-document` (pure model + tests)
   grapheme.rs        local grapheme stepping (GraphemeCursor) + full-scan fallback
   display.rs         display-aware wrapping / x mapping (width injectable)
   encoding.rs        text <-> bytes for the hex pane
-  hexdump.rs         hex layout
+  hexdump.rs         virtualized hex layout (sparse checkpoint index)
   escape.rs          invisible-character escaping
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
@@ -107,9 +107,9 @@ Owns everything that is text, offsets, or history:
 - the **incremental line index** (`line_index.rs`): per-line byte lengths plus a
   Fenwick tree of prefix sums, so `line_of_offset`/`line_range` are O(log lines)
   and a single-line edit is one point update;
-- undo/redo snapshots with a bounded history (currently full-text snapshots;
-  delta/inverse-edit undo is a known follow-up — see "Current status and known
-  limitations");
+- undo/redo as **inverse edits** (per step: the replaced range plus the removed
+  and inserted text), bounded by both `MAX_UNDO` steps and `MAX_UNDO_BYTES`;
+  memory tracks what the user changed, not the document size;
 - UTF-16 ⇄ byte offset conversion with a cached `utf16_len` and nearer-end
   walks, plus free functions for arbitrary strings (e.g. the palette query);
 - local grapheme stepping (`grapheme.rs`) using `unicode-segmentation`'s
@@ -161,6 +161,12 @@ Rules:
   limit message otherwise);
 - **expensive-transform confirmation**: `transforms::is_expensive` plus a 2 MB
   input threshold opens a modal instead of blocking the UI;
+- **hex pane**: a virtualized `HexIndex` (only visible rows are materialized,
+  carried by spacers) cached by `(document revision, encoding, bytes_per_row)`;
+  hit-testing maps encoded byte offsets back to text through the same index. It
+  owns its own scroll handle (`hex_scroll`) and a **custom vertical scrollbar**
+  with drag support, mirroring the editor's geometry helpers
+  (`hex_scroll_geometry`, `begin_hex_v_drag`, `update_hex_v_drag`);
 - async work (caret blink, IndexedDB load/save) and any debouncing timers;
 - presentation-only state (palette UI, scroll handles, drag state).
 
@@ -205,13 +211,13 @@ keep the public signatures identical across both.
 - **Never swallow errors that affect the user.** A failed autosave must reach the
   user. `let _ = op()` is only acceptable where failure is genuinely irrelevant
   (and should be commented).
-- **Bound history with a ring buffer.** Undo/redo stay O(1) at the ends via
-  `VecDeque` (`push_back`/`pop_front`) in `zapslab-document`, enforcing
-  `MAX_UNDO`. Do not reintroduce `Vec::remove(0)` on the hot path. Preserve the
-  behavior of not pushing duplicate snapshots, and keep contiguous typing runs
-  coalesced into a single undo step. Snapshots currently clone the whole text
-  (O(n) per non-coalesced edit); if you move to delta/inverse-edit undo, keep the
-  public `undo`/`redo` semantics (coalescing, dedupe, cursor/anchor restore).
+- **Undo stores inverse edits, not document snapshots.** Each step records the
+  replaced range plus the removed and inserted text, so memory tracks what the
+  user changed, not the document size. Keep the ring (`VecDeque`) O(1) at the
+  ends, enforce both `MAX_UNDO` and `MAX_UNDO_BYTES`, coalesce contiguous typing
+  runs into one step, and preserve the public `undo`/`redo` semantics
+  (coalescing, skipping no-op edits, cursor/anchor restore). A new edit clears
+  redo; undo/redo move steps between the two stacks.
 - **Throttle expensive synchronous side effects** on the hot path. IndexedDB
   writes are debounced and async; copy the document only after the debounce, and
   never block typing on storage.
@@ -260,7 +266,9 @@ keep the public signatures identical across both.
     (exhaustive + seeded fuzz);
   - local grapheme stepping, UTF-16 conversion, and `word_range_at`: differential
     tests against full-scan references over a Unicode corpus at every offset;
-  - undo/redo: push/dedupe, bounded history, restore of text + cursor + anchor;
+  - undo/redo: inverse-edit correctness (deletions, multi-line and selection
+    replacements), coalescing, no-op skipping, bounded count/bytes, and restore
+    of text + cursor + anchor;
   - CRLF/CR normalization on load and on insert/paste;
   - wrapping: row splitting and offset↔row↔x mapping. Keep glyph measurement
     injectable (a width function) so wrapping math can be tested without gpui.
@@ -289,11 +297,15 @@ keep the public signatures identical across both.
 
 ## Current status and known limitations
 
-- **Undo is still full-text snapshots.** A non-coalesced edit clones the whole
-  document (O(n)); delta/inverse-edit undo is the next planned change. Typing runs
-  coalesce, so ordinary typing does not clone per keystroke.
-- **Hex panel is not virtualized.** While open it re-encodes and lays out the
-  whole buffer each frame; caching/virtualizing it is planned.
+- **Redo leaves a plain caret.** Undo restores the exact pre-edit selection, but
+  redo places the caret at the end of the re-inserted text (caret == anchor)
+  rather than re-selecting a transform's output.
+- **Hex index rebuild is O(text).** The hex pane's sparse checkpoint index is
+  rebuilt when the document revision, encoding, or row width changes — i.e. on
+  each edit while the panel is open and while dragging the divider. Rendering is
+  virtualized, so only visible rows are materialized per frame, but the index
+  build is whole-buffer. Byte and encoding edits still encode/decode the whole
+  buffer (an explicit, user-initiated transformation).
 - **Wrap-on layout rebuild is O(lines log n)** and only runs for documents below
   the auto-disable thresholds; large buffers use wrap-off with O(1) row mapping.
 - **Pixel geometry is `f32`.** Very high row counts (tens of millions) can lose

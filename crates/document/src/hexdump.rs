@@ -1,150 +1,378 @@
-//! Byte layout for the hex panel.
+//! Virtualized byte layout for the hex panel.
 //!
 //! The panel shows the document text encoded with the selected [`Encoding`],
-//! laid out in rows of `bytes_per_row` bytes. The row length is chosen by the
-//! view from the available panel width, so the bytes flow to fill the pane.
-//! Each displayed byte keeps the range of *text* bytes it came from, so
-//! selection (which lives in text offsets) can be highlighted over the bytes.
+//! laid out in rows of `bytes_per_row` encoded bytes. Materializing a cell per
+//! encoded byte (plus a span per grapheme) costs tens of bytes per text byte,
+//! which is untenable for large documents. This module instead keeps only a
+//! sparse checkpoint index and materializes the rows that are actually visible
+//! on demand.
+//!
+//! Each encoded byte remembers the text byte range it came from, so selection
+//! (which lives in text offsets) can be highlighted over the bytes and a byte
+//! can be mapped back to text.
 
 use std::ops::Range;
 
 use crate::encoding::{self, EncodeError, Encoding};
 use crate::grapheme::grapheme_ranges;
 
-/// One grapheme's encoded bytes.
-pub struct HexSpan {
-    /// Byte range in the document text.
-    pub text_range: Range<usize>,
-    /// Byte range in the encoded output.
-    pub encoded_range: Range<usize>,
+/// Spacing between checkpoints in encoded bytes. A visible window is resolved
+/// by scanning from the nearest preceding checkpoint, so this bounds per-frame
+/// work while keeping the index tiny (a few hundred KiB at most).
+const CHECKPOINT_ENCODED_BYTES: usize = 8 * 1024;
+
+/// A grapheme boundary recorded at a known encoded offset.
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    encoded: usize,
+    text: usize,
 }
 
-/// A single encoded byte in the hex columns.
+/// Compact, virtualized layout of the encoded buffer.
+pub struct HexIndex {
+    encoding: Encoding,
+    bytes_per_row: usize,
+    encoded_len: usize,
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// One encoded byte and the text byte range it came from.
 pub struct HexCell {
     pub byte: u8,
-    /// Index into [`HexLayout::spans`].
-    pub span: usize,
-    /// Absolute byte offset within the encoded stream.
-    pub encoded_offset: usize,
+    pub text_range: Range<usize>,
 }
 
+/// A run of encoded bytes making up one row.
 pub struct HexRow {
-    /// Encoded byte offset of the first byte in this row.
+    /// Encoded byte offset of the first cell.
     pub encoded_offset: usize,
     pub cells: Vec<HexCell>,
 }
 
-pub struct HexLayout {
-    pub spans: Vec<HexSpan>,
-    pub rows: Vec<HexRow>,
-}
-
-impl HexLayout {
-    /// Encodes `text` and lays it out into rows of `bytes_per_row` bytes. Fails
-    /// when `encoding` cannot represent the text (e.g. Latin-1 with an emoji).
+impl HexIndex {
+    /// Build the checkpoint index. Fails when `encoding` cannot represent the
+    /// text (e.g. Latin-1 with an emoji). O(text), with no per-byte allocation.
     pub fn build(
         text: &str,
         encoding: Encoding,
         bytes_per_row: usize,
     ) -> Result<Self, EncodeError> {
         let bytes_per_row = bytes_per_row.max(1);
-        let mut spans = Vec::new();
-        let mut encoded = Vec::new();
-        let mut owner = Vec::new();
+        let mut checkpoints = vec![Checkpoint {
+            encoded: 0,
+            text: 0,
+        }];
+        let mut encoded = 0usize;
+        let mut next_checkpoint = CHECKPOINT_ENCODED_BYTES;
 
         for (start, end) in grapheme_ranges(text) {
-            let bytes = encoding::encode(&text[start..end], encoding)?;
-            let encoded_start = encoded.len();
-            encoded.extend_from_slice(&bytes);
-            let encoded_end = encoded.len();
-            let span_index = spans.len();
-            spans.push(HexSpan {
-                text_range: start..end,
-                encoded_range: encoded_start..encoded_end,
-            });
-            owner.extend(std::iter::repeat(span_index).take(bytes.len()));
+            encoded += encoding::encoded_len(&text[start..end], encoding)?;
+            if encoded >= next_checkpoint {
+                checkpoints.push(Checkpoint { encoded, text: end });
+                while next_checkpoint <= encoded {
+                    next_checkpoint += CHECKPOINT_ENCODED_BYTES;
+                }
+            }
         }
 
-        let rows = build_rows(&encoded, &owner, bytes_per_row);
-        Ok(Self { spans, rows })
-    }
-}
-
-fn build_rows(encoded: &[u8], owner: &[usize], bytes_per_row: usize) -> Vec<HexRow> {
-    if encoded.is_empty() {
-        return vec![HexRow {
-            encoded_offset: 0,
-            cells: Vec::new(),
-        }];
+        Ok(Self {
+            encoding,
+            bytes_per_row,
+            encoded_len: encoded,
+            checkpoints,
+        })
     }
 
-    let mut rows = Vec::new();
-    let mut start = 0;
-    while start < encoded.len() {
-        let end = (start + bytes_per_row).min(encoded.len());
-        let cells = (start..end)
-            .map(|index| HexCell {
-                byte: encoded[index],
-                span: owner[index],
-                encoded_offset: index,
-            })
-            .collect();
-        rows.push(HexRow {
-            encoded_offset: start,
-            cells,
-        });
-        start = end;
+    pub fn bytes_per_row(&self) -> usize {
+        self.bytes_per_row
     }
-    rows
+
+    /// Total encoded length in bytes.
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    /// Number of rows: at least one, so an empty buffer is one empty row.
+    pub fn row_count(&self) -> usize {
+        if self.encoded_len == 0 {
+            1
+        } else {
+            self.encoded_len.div_ceil(self.bytes_per_row)
+        }
+    }
+
+    fn checkpoint_at_or_before(&self, encoded_offset: usize) -> Checkpoint {
+        let target = encoded_offset.min(self.encoded_len);
+        let index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.encoded <= target);
+        // `checkpoints[0].encoded == 0 <= target`, so `index >= 1`.
+        self.checkpoints[index - 1]
+    }
+
+    /// Materialize rows `first..=last` (clamped). Only the bytes in that window
+    /// are encoded; graphemes before it contribute just their length.
+    pub fn rows(&self, text: &str, first: usize, last: usize) -> Vec<HexRow> {
+        let row_count = self.row_count();
+        if first > last || first >= row_count {
+            return Vec::new();
+        }
+        let last = last.min(row_count - 1);
+        if self.encoded_len == 0 {
+            return vec![HexRow {
+                encoded_offset: 0,
+                cells: Vec::new(),
+            }];
+        }
+
+        let bytes_per_row = self.bytes_per_row;
+        let start_encoded = first * bytes_per_row;
+        let end_encoded = ((last + 1) * bytes_per_row).min(self.encoded_len);
+        let checkpoint = self.checkpoint_at_or_before(start_encoded);
+
+        let mut rows = Vec::new();
+        let mut row_index = first;
+        let mut row = HexRow {
+            encoded_offset: start_encoded,
+            cells: Vec::with_capacity(bytes_per_row),
+        };
+        let mut encoded = checkpoint.encoded;
+
+        for (relative_start, relative_end) in grapheme_ranges(&text[checkpoint.text..]) {
+            let start = checkpoint.text + relative_start;
+            let end = checkpoint.text + relative_end;
+            let Ok(length) = encoding::encoded_len(&text[start..end], self.encoding) else {
+                break;
+            };
+            let grapheme_start = encoded;
+            let grapheme_end = encoded + length;
+            encoded = grapheme_end;
+
+            if grapheme_end <= start_encoded {
+                continue;
+            }
+            if grapheme_start >= end_encoded {
+                break;
+            }
+
+            // Only the overlapping window needs the actual bytes.
+            let Ok(bytes) = encoding::encode(&text[start..end], self.encoding) else {
+                break;
+            };
+            let from = grapheme_start.max(start_encoded);
+            let to = grapheme_end.min(end_encoded);
+            for &byte in &bytes[(from - grapheme_start)..(to - grapheme_start)] {
+                row.cells.push(HexCell {
+                    byte,
+                    text_range: start..end,
+                });
+                if row.cells.len() == bytes_per_row {
+                    rows.push(row);
+                    row_index += 1;
+                    if row_index > last {
+                        return rows;
+                    }
+                    row = HexRow {
+                        encoded_offset: row_index * bytes_per_row,
+                        cells: Vec::with_capacity(bytes_per_row),
+                    };
+                }
+            }
+        }
+
+        if !row.cells.is_empty() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Text byte range that produced the encoded byte at `encoded_offset`.
+    pub fn text_range_at(&self, text: &str, encoded_offset: usize) -> Option<Range<usize>> {
+        if encoded_offset >= self.encoded_len {
+            return None;
+        }
+        let checkpoint = self.checkpoint_at_or_before(encoded_offset);
+        let mut encoded = checkpoint.encoded;
+        for (relative_start, relative_end) in grapheme_ranges(&text[checkpoint.text..]) {
+            let start = checkpoint.text + relative_start;
+            let end = checkpoint.text + relative_end;
+            let length = encoding::encoded_len(&text[start..end], self.encoding).ok()?;
+            if encoded_offset < encoded + length {
+                return Some(start..end);
+            }
+            encoded += length;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const BYTES: usize = 16;
+    /// Reference layout: every encoded byte with its text range, chunked into
+    /// rows. Used to check the virtualized index.
+    fn reference(
+        text: &str,
+        encoding: Encoding,
+        bytes_per_row: usize,
+    ) -> Vec<(usize, Vec<(u8, Range<usize>)>)> {
+        let mut flat: Vec<(u8, Range<usize>)> = Vec::new();
+        for (start, end) in grapheme_ranges(text) {
+            let bytes = encoding::encode(&text[start..end], encoding).expect("encodable");
+            for byte in bytes {
+                flat.push((byte, start..end));
+            }
+        }
+        if flat.is_empty() {
+            return vec![(0, Vec::new())];
+        }
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        while offset < flat.len() {
+            let end = (offset + bytes_per_row).min(flat.len());
+            rows.push((offset, flat[offset..end].to_vec()));
+            offset = end;
+        }
+        rows
+    }
 
-    #[test]
-    fn utf8_rows_map_bytes_back_to_text() {
-        let layout = HexLayout::build("aé", Encoding::Utf8, BYTES).unwrap();
-        assert_eq!(layout.spans.len(), 2);
-        assert_eq!(layout.rows.len(), 1);
-        let row = &layout.rows[0];
-        assert_eq!(row.cells.len(), 3);
-        assert_eq!(row.cells[0].byte, b'a');
-        assert_eq!(row.cells[1].byte, 0xC3);
-        assert_eq!(row.cells[2].byte, 0xA9);
-        // Both UTF-8 bytes of `é` belong to the same two text bytes.
-        assert_eq!(layout.spans[row.cells[1].span].text_range, 1..3);
-        assert_eq!(layout.spans[row.cells[2].span].text_range, 1..3);
+    fn check(text: &str, encoding: Encoding, bytes_per_row: usize) {
+        let index = HexIndex::build(text, encoding, bytes_per_row).expect("encodable");
+        // Per-grapheme lengths must add up to the whole-string encoding, since
+        // the byte-edit path encodes the buffer in one piece and indexes it by
+        // these offsets.
+        assert_eq!(
+            index.encoded_len(),
+            encoding::encode(text, encoding).expect("encodable").len(),
+            "encoded_len for {text:?}"
+        );
+        let expected = reference(text, encoding, bytes_per_row);
+        assert_eq!(index.row_count(), expected.len(), "row_count for {text:?}");
+
+        // Every window (including the whole thing) matches the reference.
+        for first in 0..expected.len() {
+            for last in first..expected.len() {
+                let rows = index.rows(text, first, last);
+                assert_eq!(
+                    rows.len(),
+                    last - first + 1,
+                    "rows({first},{last}) for {text:?}"
+                );
+                for (offset, row) in rows.iter().enumerate() {
+                    let (expected_offset, expected_cells) = &expected[first + offset];
+                    assert_eq!(row.encoded_offset, *expected_offset);
+                    assert_eq!(row.cells.len(), expected_cells.len());
+                    for (cell, (byte, range)) in row.cells.iter().zip(expected_cells) {
+                        assert_eq!(cell.byte, *byte);
+                        assert_eq!(&cell.text_range, range);
+                    }
+                }
+            }
+        }
+
+        // Every encoded byte maps back to its grapheme's text range.
+        for (offset, cells) in expected.iter().flat_map(|(_, cells)| cells).enumerate() {
+            assert_eq!(
+                index.text_range_at(text, offset),
+                Some(cells.1.clone()),
+                "text_range_at({offset}) for {text:?}"
+            );
+        }
+        assert_eq!(index.text_range_at(text, index.encoded_len()), None);
     }
 
     #[test]
     fn empty_buffer_is_one_empty_row() {
-        let layout = HexLayout::build("", Encoding::Utf8, BYTES).unwrap();
-        assert_eq!(layout.rows.len(), 1);
-        assert!(layout.rows[0].cells.is_empty());
+        let index = HexIndex::build("", Encoding::Utf8, 16).unwrap();
+        assert_eq!(index.row_count(), 1);
+        let rows = index.rows("", 0, 0);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].cells.is_empty());
     }
 
     #[test]
-    fn bytes_per_row_controls_wrapping_and_offsets() {
-        let layout = HexLayout::build(&"x".repeat(20), Encoding::Utf8, 8).unwrap();
-        assert_eq!(layout.rows.len(), 3);
-        assert_eq!(layout.rows[0].cells.len(), 8);
-        assert_eq!(layout.rows[1].encoded_offset, 8);
-        assert_eq!(layout.rows[2].cells.len(), 4);
-        assert_eq!(layout.rows[2].encoded_offset, 16);
+    fn matches_reference_across_encodings_and_widths() {
+        for text in [
+            "hello",
+            "héllo",
+            "a😀b",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "line one\nline two\n",
+            "e\u{301}x",
+        ] {
+            for encoding in [
+                Encoding::Utf8,
+                Encoding::Utf16Le,
+                Encoding::Utf16Be,
+                Encoding::Utf32Le,
+                Encoding::Utf32Be,
+                Encoding::Latin1,
+            ] {
+                if encoding == Encoding::Latin1 && text.chars().any(|ch| ch as u32 > 0xFF) {
+                    continue;
+                }
+                for bytes_per_row in [1usize, 3, 4, 7, 16] {
+                    check(text, encoding, bytes_per_row);
+                }
+            }
+        }
     }
 
     #[test]
-    fn latin1_encoding_is_one_byte_per_character() {
-        let layout = HexLayout::build("é", Encoding::Latin1, BYTES).unwrap();
-        assert_eq!(layout.rows[0].cells.len(), 1);
-        assert_eq!(layout.rows[0].cells[0].byte, 0xE9);
+    fn windows_across_checkpoints_match_reference() {
+        // Longer than CHECKPOINT_ENCODED_BYTES so multiple checkpoints exist.
+        let text = "abcd😀efgh\n".repeat(4000);
+        for bytes_per_row in [5usize, 16, 64] {
+            let index = HexIndex::build(&text, Encoding::Utf16Le, bytes_per_row).unwrap();
+            let expected = reference(&text, Encoding::Utf16Le, bytes_per_row);
+            assert_eq!(index.row_count(), expected.len());
+            // Sample windows spread across the buffer, including near the end.
+            for &first in &[
+                0,
+                1,
+                37,
+                expected.len() / 2,
+                expected.len() - 3,
+                expected.len() - 1,
+            ] {
+                let last = (first + 5).min(expected.len() - 1);
+                let rows = index.rows(&text, first, last);
+                assert_eq!(rows.len(), last - first + 1);
+                for (offset, row) in rows.iter().enumerate() {
+                    let (expected_offset, expected_cells) = &expected[first + offset];
+                    assert_eq!(row.encoded_offset, *expected_offset);
+                    assert_eq!(row.cells.len(), expected_cells.len());
+                    for (cell, (byte, range)) in row.cells.iter().zip(expected_cells) {
+                        assert_eq!(cell.byte, *byte);
+                        assert_eq!(&cell.text_range, range);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn straddling_grapheme_spans_rows() {
+        // "€" is three UTF-8 bytes; with two-byte rows the grapheme straddles
+        // rows 0 and 1.
+        let text = "€";
+        let index = HexIndex::build(text, Encoding::Utf8, 2).unwrap();
+        assert_eq!(index.row_count(), 2);
+        let rows = index.rows(text, 0, 1);
+        assert_eq!(rows[0].cells.len(), 2);
+        assert_eq!(rows[1].cells.len(), 1);
+        // Every byte maps back to the whole grapheme.
+        for row in &rows {
+            for cell in &row.cells {
+                assert_eq!(cell.text_range, 0..3);
+            }
+        }
     }
 
     #[test]
     fn unrepresentable_text_fails() {
-        assert!(HexLayout::build("😀", Encoding::Latin1, BYTES).is_err());
+        assert!(HexIndex::build("😀", Encoding::Latin1, 16).is_err());
+        assert!(HexIndex::build("é", Encoding::Ascii, 16).is_err());
     }
 }

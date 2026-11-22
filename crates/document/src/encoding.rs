@@ -144,6 +144,32 @@ pub fn encode(text: &str, encoding: Encoding) -> Result<Vec<u8>, EncodeError> {
     }
 }
 
+/// Encoded length of `text` in bytes, without allocating. Fails on a code point
+/// that the encoding cannot represent, exactly like [`encode`].
+pub fn encoded_len(text: &str, encoding: Encoding) -> Result<usize, EncodeError> {
+    match encoding {
+        Encoding::Utf8 => Ok(text.len()),
+        Encoding::Utf16Le | Encoding::Utf16Be => Ok(text.encode_utf16().count() * 2),
+        Encoding::Utf32Le | Encoding::Utf32Be => Ok(text.chars().count() * 4),
+        Encoding::Latin1 => {
+            for ch in text.chars() {
+                if ch as u32 > 0xFF {
+                    return Err(EncodeError { character: ch });
+                }
+            }
+            Ok(text.chars().count())
+        }
+        Encoding::Ascii => {
+            for ch in text.chars() {
+                if !ch.is_ascii() {
+                    return Err(EncodeError { character: ch });
+                }
+            }
+            Ok(text.len())
+        }
+    }
+}
+
 /// Decodes `bytes` with `encoding`, failing on byte sequences that are not
 /// valid text in that encoding.
 pub fn decode(bytes: &[u8], encoding: Encoding) -> Result<String, DecodeError> {
@@ -270,5 +296,22 @@ mod tests {
     fn utf16_endianness_matters() {
         assert_eq!(encode("A", Encoding::Utf16Le).unwrap(), vec![0x41, 0x00]);
         assert_eq!(encode("A", Encoding::Utf16Be).unwrap(), vec![0x00, 0x41]);
+    }
+
+    #[test]
+    fn encoded_len_matches_encode() {
+        for text in ["", "hello", "héllo", "a😀b", "\u{1F468}\u{200D}\u{1F469}"] {
+            for encoding in ALL {
+                assert_eq!(
+                    encoded_len(text, *encoding).map(|len| len),
+                    encode(text, *encoding).map(|bytes| bytes.len()),
+                    "{} for {text:?}",
+                    encoding.label()
+                );
+            }
+        }
+        // Unrepresentable code points report the same error as `encode`.
+        assert!(encoded_len("😀", Encoding::Latin1).is_err());
+        assert!(encoded_len("é", Encoding::Ascii).is_err());
     }
 }

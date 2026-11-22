@@ -23,7 +23,7 @@ use std::{
 use zapslab_document::{
     Document, MAX_DOCUMENT_BYTES, byte_offset_for_utf16, display,
     encoding::{self, Encoding},
-    hexdump::HexLayout,
+    hexdump::HexIndex,
     utf16_offset,
 };
 use gpui::{
@@ -297,10 +297,15 @@ pub struct Scratchpad {
     /// Whether a drag-selection is in progress in the hex panel.
     hex_dragging: bool,
     hex_scroll: ScrollHandle,
+    /// Active drag on the hex pane's vertical scrollbar thumb.
+    hex_v_drag: Option<ScrollDrag>,
     /// Bounds of the hex content area, recorded in paint for hit-testing.
     hex_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// Most recent hex layout, reused for painting and hit-testing.
-    hex_layout: Option<HexLayout>,
+    /// Cached virtualized hex layout, rebuilt only when the document revision,
+    /// encoding, or row width changes.
+    hex_index: Option<HexIndex>,
+    /// Key `hex_index` was built for: `(revision, encoding, bytes_per_row)`.
+    hex_index_key: Option<(u64, Encoding, usize)>,
     /// Device-pixel-snapped hex row height, refreshed each render so rows,
     /// hit-testing, and painting share one row pitch.
     hex_line_height: Cell<f32>,
@@ -382,8 +387,10 @@ impl Scratchpad {
             hex_drag: None,
             hex_dragging: false,
             hex_scroll: ScrollHandle::default(),
+            hex_v_drag: None,
             hex_bounds: Rc::new(Cell::new(None)),
-            hex_layout: None,
+            hex_index: None,
+            hex_index_key: None,
             hex_line_height: Cell::new(HEX_FONT_SIZE * LINE_HEIGHT_RATIO),
             encoding_prompt: None,
             byte_edit: None,
@@ -1730,7 +1737,12 @@ impl Scratchpad {
         bounds: Bounds<Pixels>,
         cx: &App,
     ) -> Option<usize> {
-        let layout = self.hex_layout.as_ref()?;
+        let index = self.hex_index.as_ref()?;
+        // Ignore an index that predates the current text (an edit between the
+        // last render and this event); the next render rebuilds it.
+        if self.hex_index_key.map(|key| key.0) != Some(self.document.revision()) {
+            return None;
+        }
         let metrics = self.hex_metrics(cx);
         let origin_x = f32::from(bounds.origin.x) + PAD;
         let origin_y = f32::from(bounds.origin.y) + PAD;
@@ -1740,30 +1752,41 @@ impl Scratchpad {
             return None;
         }
         let row_index = (relative_y / metrics.line_height).floor() as usize;
-        let row = layout.rows.get(row_index)?;
+        if row_index >= index.row_count() {
+            return None;
+        }
 
-        let row_start = row
-            .cells
-            .first()
-            .map(|cell| layout.spans[cell.span].text_range.start);
-        let row_end = row
-            .cells
-            .last()
-            .map(|cell| layout.spans[cell.span].text_range.end);
+        let bytes_per_row = index.bytes_per_row();
+        let text = self.document.text();
+        let row_encoded = row_index * bytes_per_row;
+        let row_start = index
+            .text_range_at(text, row_encoded)
+            .map(|range| range.start);
+        let last_encoded = ((row_index + 1) * bytes_per_row)
+            .min(index.encoded_len())
+            .saturating_sub(1);
+        let row_end = index
+            .text_range_at(text, last_encoded)
+            .map(|range| range.end)
+            .or(row_start);
 
         // Offset column selects the start of the row.
         if relative_x < metrics.offset_width {
             return row_start;
         }
 
-        for (index, cell) in row.cells.iter().enumerate() {
-            let cell_left = metrics.offset_width + metrics.byte_x(index);
+        for column in 0..bytes_per_row {
+            let encoded = row_encoded + column;
+            if encoded >= index.encoded_len() {
+                break;
+            }
+            let cell_left = metrics.offset_width + metrics.byte_x(column);
             if relative_x >= cell_left && relative_x < cell_left + metrics.byte_width {
-                let span = &layout.spans[cell.span];
+                let range = index.text_range_at(text, encoded)?;
                 return Some(if relative_x < cell_left + metrics.byte_width * 0.5 {
-                    span.text_range.start
+                    range.start
                 } else {
-                    span.text_range.end
+                    range.end
                 });
             }
         }
@@ -1810,7 +1833,12 @@ impl Scratchpad {
         bounds: Bounds<Pixels>,
         cx: &App,
     ) -> Option<usize> {
-        let layout = self.hex_layout.as_ref()?;
+        let index = self.hex_index.as_ref()?;
+        // Ignore an index that predates the current text; the next render
+        // rebuilds it.
+        if self.hex_index_key.map(|key| key.0) != Some(self.document.revision()) {
+            return None;
+        }
         let metrics = self.hex_metrics(cx);
         let origin_x = f32::from(bounds.origin.x) + PAD;
         let origin_y = f32::from(bounds.origin.y) + PAD;
@@ -1820,14 +1848,105 @@ impl Scratchpad {
             return None;
         }
         let row_index = (relative_y / metrics.line_height).floor() as usize;
-        let row = layout.rows.get(row_index)?;
-        for (index, cell) in row.cells.iter().enumerate() {
-            let cell_left = metrics.offset_width + metrics.byte_x(index);
+        if row_index >= index.row_count() {
+            return None;
+        }
+        let bytes_per_row = index.bytes_per_row();
+        let row_encoded = row_index * bytes_per_row;
+        for column in 0..bytes_per_row {
+            let encoded = row_encoded + column;
+            if encoded >= index.encoded_len() {
+                break;
+            }
+            let cell_left = metrics.offset_width + metrics.byte_x(column);
             if relative_x >= cell_left && relative_x < cell_left + metrics.byte_width {
-                return Some(cell.encoded_offset);
+                return Some(encoded);
             }
         }
         None
+    }
+
+    /// `(content_height, viewport_height, overflow)` for the hex pane's scroll
+    /// area, shared by the scrollbar's paint and drag handlers.
+    fn hex_scroll_geometry(&self, window: &Window) -> Option<(f32, f32, f32)> {
+        let index = self.hex_index.as_ref()?;
+        let line_height = f32::from(self.hex_line_height.get());
+        let content_height = index.row_count() as f32 * line_height + 2.0 * PAD;
+        let viewport_height =
+            (f32::from(window.viewport_size().height) - 2.0 * STATUS_BAR_HEIGHT).max(1.0);
+        let overflow = (content_height - viewport_height).max(0.0);
+        Some((content_height, viewport_height, overflow))
+    }
+
+    fn update_hex_v_drag(
+        &mut self,
+        position_y: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(drag) = self.hex_v_drag else {
+            return false;
+        };
+        let Some((content_height, viewport_height, overflow)) = self.hex_scroll_geometry(window)
+        else {
+            self.hex_v_drag = None;
+            return false;
+        };
+        if overflow <= 0.0 {
+            self.hex_v_drag = None;
+            return false;
+        }
+        let track_height = (viewport_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+        let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+        let thumb_height =
+            (track_height * viewport_height / content_height).clamp(min_thumb, track_height);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel <= 0.0 {
+            self.hex_v_drag = None;
+            return false;
+        }
+        let fraction = ((position_y - STATUS_BAR_HEIGHT - drag.grab - SCROLLBAR_MARGIN) / travel)
+            .clamp(0.0, 1.0);
+        let offset = self.hex_scroll.offset();
+        self.hex_scroll
+            .set_offset(point(offset.x, px(-fraction * overflow)));
+        cx.notify();
+        true
+    }
+
+    fn begin_hex_v_drag(
+        &mut self,
+        position: Point<Pixels>,
+        centered: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.hex_dragging = false;
+        let Some((content_height, viewport_height, overflow)) = self.hex_scroll_geometry(window)
+        else {
+            return;
+        };
+        if overflow <= 0.0 {
+            return;
+        }
+        let track_height = (viewport_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+        let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+        let thumb_height =
+            (track_height * viewport_height / content_height).clamp(min_thumb, track_height);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel <= 0.0 {
+            return;
+        }
+        let grab = if centered {
+            thumb_height / 2.0
+        } else {
+            let offset_y = (-f32::from(self.hex_scroll.offset().y)).clamp(0.0, overflow);
+            let thumb_top = SCROLLBAR_MARGIN + (offset_y / overflow) * travel;
+            f32::from(position.y) - (STATUS_BAR_HEIGHT + thumb_top)
+        };
+        self.hex_v_drag = Some(ScrollDrag { grab });
+        self.update_hex_v_drag(f32::from(position.y), window, cx);
     }
 
     fn push_byte_edit(&mut self, text: &str) {
@@ -1985,6 +2104,7 @@ impl Scratchpad {
         &mut self,
         panel_width: f32,
         bytes_per_row: usize,
+        hex_viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let metrics = self.hex_metrics(cx);
@@ -1992,13 +2112,33 @@ impl Scratchpad {
         // Highlight the byte currently open in the inline editor so the cell
         // being changed stays visually tied to the "Edit byte" dialog.
         let editing_offset = self.byte_edit.as_ref().map(|edit| edit.offset);
+        let content_width =
+            2.0 * PAD + metrics.offset_width + bytes_per_row as f32 * metrics.step();
 
-        let content = match &self.hex_layout {
-            Some(layout) => {
+        let content = match &self.hex_index {
+            Some(index) => {
+                // Only the rows in the viewport are materialized; the rest of the
+                // scroll extent is carried by spacers, exactly like the editor.
+                let total_rows = index.row_count();
+                let scroll_top = (-f32::from(self.hex_scroll.offset().y)).max(0.0);
+                let first =
+                    ((scroll_top / line_height).floor() as usize).min(total_rows.saturating_sub(1));
+                let visible = (hex_viewport_height / line_height).ceil() as usize
+                    + 2 * OVERSCAN_ROWS as usize;
+                let last = first
+                    .saturating_add(visible)
+                    .min(total_rows.saturating_sub(1));
+
+                let total_height = total_rows as f32 * line_height + 2.0 * PAD;
+                let top_spacer = first as f32 * line_height;
+                let bottom_spacer =
+                    total_rows.saturating_sub(last).saturating_sub(1) as f32 * line_height;
+
                 let (selection_start, selection_end) = self.document.selection_range();
-                let mut rows: Vec<AnyElement> = Vec::with_capacity(layout.rows.len());
+                let rows = index.rows(self.document.text(), first, last);
+                let mut row_elements: Vec<AnyElement> = Vec::with_capacity(rows.len());
 
-                for row in &layout.rows {
+                for row in &rows {
                     // Paint the selection as each byte div's background rather
                     // than recomputing cell rectangles for a canvas overlay: the
                     // per-element pixel snapping gpui applies while laying out
@@ -2006,8 +2146,8 @@ impl Scratchpad {
                     // with every column. Binding the highlight to the cell's own
                     // bounds keeps it aligned at any width.
                     let mut cells: Vec<AnyElement> = Vec::with_capacity(bytes_per_row);
-                    for index in 0..bytes_per_row {
-                        let Some(cell) = row.cells.get(index) else {
+                    for column in 0..bytes_per_row {
+                        let Some(cell) = row.cells.get(column) else {
                             // Pad short rows so the columns line up.
                             cells.push(
                                 div()
@@ -2019,12 +2159,8 @@ impl Scratchpad {
                             );
                             continue;
                         };
-                        let selected = intersects(
-                            &layout.spans[cell.span].text_range,
-                            selection_start,
-                            selection_end,
-                        );
-                        let editing = Some(cell.encoded_offset) == editing_offset;
+                        let selected = intersects(&cell.text_range, selection_start, selection_end);
+                        let editing = Some(row.encoded_offset + column) == editing_offset;
                         let mut cell_div = div()
                             .w(px(metrics.byte_width))
                             .h(px(line_height))
@@ -2041,7 +2177,7 @@ impl Scratchpad {
                         cells.push(cell_div.into_any_element());
                     }
 
-                    rows.push(
+                    row_elements.push(
                         div()
                             .h(px(line_height))
                             .flex()
@@ -2060,8 +2196,6 @@ impl Scratchpad {
                     );
                 }
 
-                let content_width =
-                    2.0 * PAD + metrics.offset_width + bytes_per_row as f32 * metrics.step();
                 // The overlay no longer paints; it only records the content
                 // bounds so pointer hit-testing maps to the same geometry.
                 let bounds_cell = self.hex_bounds.clone();
@@ -2082,11 +2216,14 @@ impl Scratchpad {
                     .text_size(px(HEX_FONT_SIZE))
                     .line_height(px(line_height))
                     .text_color(rgb(0xa6adc8))
-                    .children(rows);
+                    .child(div().h(px(top_spacer)))
+                    .children(row_elements)
+                    .child(div().h(px(bottom_spacer)));
 
                 div()
                     .relative()
                     .w(px(content_width.max(1.0)))
+                    .h(px(total_height))
                     .child(padded)
                     .child(overlay)
             }
@@ -2097,6 +2234,72 @@ impl Scratchpad {
                     .text_color(rgb(0xf38ba8))
                     .child("Buffer cannot be encoded in this encoding"),
             ),
+        };
+
+        // Vertical scrollbar for the hex pane (gpui draws none for overflow
+        // containers), mirroring the editor's.
+        let hex_scrollbar = {
+            if let Some(index) = self.hex_index.as_ref() {
+                let content_height = index.row_count() as f32 * line_height + 2.0 * PAD;
+                let overflow = (content_height - hex_viewport_height).max(0.0);
+                if overflow > 0.0 {
+                    let track_height = (hex_viewport_height - 2.0 * SCROLLBAR_MARGIN).max(1.0);
+                    let min_thumb = MIN_THUMB_WIDTH.min(track_height);
+                    let thumb_height = (track_height * hex_viewport_height / content_height)
+                        .clamp(min_thumb, track_height);
+                    let travel = (track_height - thumb_height).max(0.0);
+                    let offset_y = (-f32::from(self.hex_scroll.offset().y)).clamp(0.0, overflow);
+                    let thumb_top = SCROLLBAR_MARGIN + (offset_y / overflow) * travel;
+                    Some(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .w(px(SCROLLBAR_HEIGHT))
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                            this.begin_hex_v_drag(event.position, true, window, cx);
+                                        }),
+                                    )
+                                    .child(div().w(px(6.0)).h(px(thumb_top)))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(thumb_height))
+                                            .bg(rgb(0x45475a))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &MouseDownEvent, window, cx| {
+                                                        this.begin_hex_v_drag(
+                                                            event.position,
+                                                            false,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                ),
+                                            ),
+                                    ),
+                            ),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
         let header = div()
@@ -2140,21 +2343,29 @@ impl Scratchpad {
             .child(header)
             .child(
                 div()
-                    .id("zapslab-hex-scroll")
                     .flex_1()
                     .min_h(px(0.0))
                     .relative()
                     .w_full()
-                    .overflow_y_scroll()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.hex_scroll)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.on_hex_mouse_down(event, window, cx);
-                        }),
+                    .child(
+                        div()
+                            .id("zapslab-hex-scroll")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .overflow_y_scroll()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.hex_scroll)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.on_hex_mouse_down(event, window, cx);
+                                }),
+                            )
+                            .child(content),
                     )
-                    .child(content),
+                    .children(hex_scrollbar),
             )
             .into_any_element()
     }
@@ -2387,20 +2598,28 @@ impl Render for Scratchpad {
         // The vertical scrollbar's drag math reads the painted extent back.
         self.content_height.set(total_height);
 
-        // Rebuild the hex layout for this frame. The row length is derived from
-        // the panel width so the bytes fill the pane, and the layout is reused by
-        // hit-testing so clicks map to the same bytes that are drawn.
+        // The row length is derived from the panel width so the bytes fill the
+        // pane. The virtualized index is rebuilt only when the document revision,
+        // encoding, or row width changes (not every frame), and hit-testing reads
+        // the same index.
         let hex_bytes = if self.hex_panel {
             hex_bytes_per_row(panel_width, &self.hex_metrics(cx))
         } else {
             1
         };
-        let hex_layout = if self.hex_panel {
-            HexLayout::build(self.document.text(), self.hex_encoding, hex_bytes).ok()
+        let hex_viewport_height = (viewport_height - 2.0 * STATUS_BAR_HEIGHT).max(1.0);
+        if self.hex_panel {
+            let key = (self.document.revision(), self.hex_encoding, hex_bytes);
+            if self.hex_index_key != Some(key) {
+                self.hex_index =
+                    HexIndex::build(self.document.text(), self.hex_encoding, hex_bytes).ok();
+                self.hex_index_key = Some(key);
+            }
         } else {
-            None
-        };
-        self.hex_layout = hex_layout;
+            // Free the index while the panel is closed.
+            self.hex_index = None;
+            self.hex_index_key = None;
+        }
 
         // Shape each visible row as a single text element (see `row_element` for
         // why a single `StyledText` keeps the overlay geometry exact). Only the
@@ -3106,7 +3325,7 @@ impl Render for Scratchpad {
                                 }),
                             ),
                     )
-                    .child(self.render_hex_pane(panel_width, hex_bytes, cx)),
+                    .child(self.render_hex_pane(panel_width, hex_bytes, hex_viewport_height, cx)),
             )
         } else {
             None
@@ -3170,6 +3389,12 @@ impl Render for Scratchpad {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.hex_drag.is_some() {
                     this.update_hex_panel_drag(event, window, cx);
+                } else if this.hex_v_drag.is_some() {
+                    if event.dragging() {
+                        this.update_hex_v_drag(f32::from(event.position.y), window, cx);
+                    } else {
+                        this.hex_v_drag = None;
+                    }
                 } else if this.hex_dragging {
                     this.on_hex_mouse_move(event, window, cx);
                 }
@@ -3178,6 +3403,7 @@ impl Render for Scratchpad {
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
                     this.hex_drag = None;
+                    this.hex_v_drag = None;
                     this.hex_dragging = false;
                 }),
             )
