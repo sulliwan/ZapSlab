@@ -24,8 +24,6 @@ src/                 root crate `zapslab` (gpui view + platform glue)
   app/view/          cohesive `impl Scratchpad` groups (find, hex, mouse,
                      palette, paint, scroll) + shared scrollbar geometry
   commands.rs        palette commands that open UI (find / find-replace)
-  find.rs            pure find/replace engine (regex + literal, capture expansion,
-                     one-step replace-all)
   storage.rs         IndexedDB document + localStorage recent list
                      (wasm-only + non-wasm stub)
   version.rs         app name/version + page -> app "new build" notification
@@ -40,6 +38,9 @@ crates/document/     standalone crate `zapslab-document` (pure model + tests)
   encoding.rs        text <-> bytes for the hex pane
   hexdump.rs         virtualized hex layout (sparse checkpoint index)
   escape.rs          invisible-character escaping
+  find.rs            find/replace engine (fancy-regex: literal + regex,
+                     look-around/backreferences, multi-line, capture expansion,
+                     one-step replace-all)
 web/                 static PWA shell: index.html, manifest, sw.js, fonts, icons
 scripts/             build_web.sh (wasm-bindgen + wasm-opt packaging), gen_icons.py
                      + zapslab-icon-64.png (icon source artwork), bump_version.py
@@ -58,15 +59,25 @@ Treat that crate as the home for all non-gpui logic described below; the gpui
 mapping, and undo work to it. The document is a flat `String` plus indices (no
 rope); the invariants that keep edits off the whole buffer are described below.
 
-The one deliberate exception is `src/find.rs`: it is pure (no gpui/wasm) but
-lives in the root crate because it depends on `regex`, which is already a root
-dependency via gpui and is not part of the document crate's std-only + Unicode
-dependency set. Keep `crates/document` free of `regex`.
+The find/replace engine also lives in `crates/document` (`find.rs`): it is pure
+logic over text, and its `fancy-regex` dependency is pure-Rust and wasm-safe, so
+it compiles offline and is covered by `make test` like the rest of the model.
 
 ## Build, check, test, serve, and deploy
 
 All root-crate builds run inside the pinned builder image. The host only needs
 `make` and a container runtime (`nerdctl`, `docker`, or `podman`).
+
+**Container targets must run outside the Zed agent sandbox.** The default
+terminal sandbox mounts `/run/user/$UID` read-only, so rootless Podman cannot
+create its runtime directory and fails with
+`mkdir /run/user/1000/libpod: read-only file system`. Run `make` from a normal
+shell, or have the agent run it with the terminal sandbox disabled. The
+Makefile picks the runtime with `RUNTIME ?=` (`nerdctl` → `docker` → `podman`;
+override with e.g. `make check RUNTIME=podman`) and, on SELinux-enforcing hosts,
+appends `:Z` to the bind mounts via `SELINUX_RELABEL` (gated on
+`/sys/fs/selinux/enforce`). The suffix is empty on non-SELinux machines, so
+nerdctl/docker hosts keep the original mount flags.
 
 ```sh
 make image       # build the builder image (docker/Dockerfile)
@@ -85,24 +96,44 @@ make vendor-wgpu # materialize the patched wgpu source
 make clean       # remove target/, dist/, .cache/
 ```
 
+**When to use which target.** Every root-crate operation goes through `make`
+(never a host `cargo` invocation — see the first rule below). Quick mapping:
+
+- `make image` — first checkout, or after editing `docker/Dockerfile*`.
+- `make check` — type-check the root crate after a Rust edit (fastest feedback).
+- `make test` — logic change in `crates/document`.
+- `make web` — produce the deployable PWA bundle (`make wasm` for the wasm
+  binary only).
+- `make serve` — build `web`, then serve `dist/` at <http://localhost:8119>.
+- `make deploy` — publish to Cloudflare Pages (builds images / logs in as
+  needed).
+- `make bump_version major|minor|revision` — bump the app version.
+- `make icons` — re-render the PWA icons from the source artwork.
+- `make shell` — inspect or run commands inside the builder image.
+- `make clean` — remove `target/`, `dist/`, and `.cache/`.
+
 Rules:
 
+- **Never assume a Rust toolchain is installed on the host.** `cargo`/`rustc`
+  may not exist. Run every Rust command inside an ephemeral container — the
+  `make` targets when one fits, otherwise `podman run --rm` (or the configured
+  runtime) against the builder image. This includes standalone helper crates
+  used to run the `src/transforms` tests; do not `cargo test` them on the host.
 - **Do not run plain `cargo build`/`cargo check` on the host for the root
   package.** The gpui crates are git dependencies pinned to a zed revision, and
   `Cargo.toml` `[patch]`es wgpu to `.cache/wgpu-patched`, which only exists after
   `make vendor-wgpu` (which `make check`/`make wasm`/`make web` depend on).
 - The one exception is `crates/document`: its only dependencies are pure-Rust
   Unicode crates (`unicode-segmentation`, `unicode-properties`) with no
-  gpui/wasm, so it can be tested directly with
-  `cd crates/document && cargo test`. Prefer `make test` for consistency; it runs
-  the same tests in the container.
-- `make test` covers **only** `crates/document`. The root crate's `#[cfg(test)]`
-  code (including `src/transforms/`) is not run by any Makefile target. Type-check
-  it inside the builder image with
+  gpui/wasm, so it can be tested without the wgpu patch. Still run it in a
+  container (`make test`, or the builder image) rather than on the host.
+- `make test` covers `crates/document` (the document model and the find engine).
+  The root crate's `#[cfg(test)]` code (notably `src/transforms/`) is not run by
+  any Makefile target. Type-check it inside the builder image with
   `cargo check --tests --target wasm32-unknown-unknown`; to actually run those
   tests, use a standalone crate that path-includes `src/transforms/mod.rs`.
 - **Deployment uses `wrangler login --device` (OAuth device authorization),
-  not the localhost callback flow.** Rootless nerdctl cannot expose a
+  not the localhost callback flow.** Rootless nerdctl/podman cannot expose a
   container's loopback listener to the host browser, so port publishing and
   host networking are not an option; the device flow needs neither. Login state
   lives in the gitignored `.wrangler/` (deliberately outside `.cache/`, so
@@ -149,10 +180,10 @@ Owns everything that is text, offsets, or history:
 
 Rules:
 
-- **No gpui, wasm-bindgen, or web-sys imports.** Keep it `std`-only apart from
-  vetted, pure-Rust Unicode crates (currently `unicode-segmentation` and
-  `unicode-properties`), so it stays fast to compile and unit-testable without a
-  GPU, browser, or network.
+- **No gpui, wasm-bindgen, or web-sys imports.** Keep it pure Rust apart from
+  vetted, pure-Rust crates (currently the Unicode helpers `unicode-segmentation`
+  and `unicode-properties`, plus `fancy-regex` for the find engine), so it stays
+  fast to compile and unit-testable without a GPU, browser, or network.
 - Public API should be pure functions/methods over owned state: `replace`,
   `insert`, `backspace`, `delete_forward`, movement, selection, `undo`/`redo`,
   line queries, UTF-16 mapping. Return results instead of touching a window.
@@ -193,11 +224,15 @@ Rules:
 - **expensive-transform confirmation**: `transforms::is_expensive` plus a 2 MB
   input threshold opens a modal instead of blocking the UI;
 - **find/replace**: `Ctrl/Cmd+F` toggles a modal dialog (`Ctrl/Cmd+Shift+F` is a
-  fallback where the browser reserves Ctrl+F). The pure engine is `src/find.rs`;
-  `Scratchpad` owns the dialog state, key/input routing, and the overlay.
+  fallback where the browser reserves Ctrl+F). The pure engine is
+  `zapslab_document::find`; `Scratchpad` owns the dialog state, key/input
+  routing, and the overlay.
   Literal and regex searches share one matcher (literal queries are escaped),
-  with a regex toggle and a Unicode-aware case-insensitive toggle. Each field
-  keeps its own grapheme-aware caret (arrows, Home/End, Backspace/Delete),
+  with a regex toggle, a multiline (`m`) toggle for line-anchored `^`/`$`, and a
+  Unicode-aware case-insensitive toggle. Search uses `fancy-regex`, so patterns
+  may use look-around and backreferences; a valid but too-expensive pattern
+  surfaces "Regex too complex" rather than silently reading as no match. Each
+  field keeps its own grapheme-aware caret (arrows, Home/End, Backspace/Delete),
   Shift+arrows and mouse drag select within a field, and typed text inserts at
   the caret (replacing any selection). Reopening restores the last closed dialog
   state (query, replacement, toggles, focused field), and Up/Down in the query
@@ -355,10 +390,9 @@ with a different binary is still detected.
   them through the containerized target, not host cargo for the root crate.
   Because the root crate pulls in gpui, the pure transform tests are easiest to
   run via a small standalone crate that path-includes `src/transforms/mod.rs`.
-- `src/find.rs`'s engine follows the same pattern: keep `#[cfg(test)] mod tests`
-  alongside it and run it through a standalone crate that path-includes
-  `src/find.rs`. `cargo check --tests --target wasm32-unknown-unknown` only type-
-  checks those tests; the standalone crate is what actually runs them.
+- The find/replace engine (`crates/document/src/find.rs`) keeps its
+  `#[cfg(test)] mod tests` alongside it and is covered by `make test` like the
+  rest of the model — no standalone harness is needed.
 
 ## Definition of done
 
@@ -368,15 +402,15 @@ with a different binary is still detected.
       stay incremental or local).
 - [ ] Input that would exceed `MAX_DOCUMENT_BYTES` is refused before mutating.
 - [ ] Pure model logic lives in `crates/document`; no gpui/wasm imports there.
-      The find engine (`src/find.rs`) is the deliberate exception: pure, but in
-      the root crate for its `regex` dependency.
+      This includes the find/replace engine.
 - [ ] Public signatures stay uniform across wasm and non-wasm builds.
 - [ ] Errors that affect the user are surfaced (especially autosave).
 - [ ] Constants are named; invariants are documented with *why* comments.
 - [ ] Stale milestones, `#[allow(...)]`, and misleading comments are removed.
 - [ ] Formatting matches rustfmt defaults and the surrounding code.
-- [ ] New pure-logic dependencies in `crates/document` are vetted Unicode crates
-      (no gpui/wasm) and pinned to the versions available in the build cache.
+- [ ] New pure-logic dependencies in `crates/document` are pure-Rust crates
+      (no gpui/wasm) pinned to versions available in the build cache; the Unicode
+      helpers and `fancy-regex` are the current set.
 
 ## Current status and known limitations
 
@@ -397,6 +431,14 @@ with a different binary is still detected.
   No matches / Wrapped instead of a live total count, which would rescan on
   every keystroke. Regex and replace-all whole-buffer cost is accepted as
   user-initiated work.
+- **Look-around/backreference patterns run on a backtracking VM** and can hit
+  `fancy-regex`'s backtrack/stack limit on adversarial input, surfacing
+  "Regex too complex". Plain patterns still delegate to the linear-time `regex`
+  engine. "Find prev" over a backtracking pattern also scans forward.
+- **The saved find-state format gained a `multi_line` field**, so a value saved
+  by an older build fails to deserialize and is ignored once (the dialog opens
+  with defaults); the key stays `zapslab.find-state.v1`, per the versioned-key
+  convention.
 - **Browser `Ctrl+F` may not be interceptable.** In some browsers a normal tab
   reserves `Ctrl/Cmd+F`, so `preventDefault` may not suppress native find even
   though the key is handled. Verify in the installed PWA; `Ctrl/Cmd+Shift+F` and

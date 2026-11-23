@@ -1,6 +1,5 @@
 mod app;
 mod commands;
-mod find;
 mod storage;
 mod transforms;
 mod version;

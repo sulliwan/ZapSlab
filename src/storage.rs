@@ -22,6 +22,7 @@ pub struct SavedFindState {
     pub replace: String,
     pub regex: bool,
     pub case_insensitive: bool,
+    pub multi_line: bool,
     pub replace_focused: bool,
 }
 
@@ -205,9 +206,10 @@ mod imp {
 
     pub fn load_find_state() -> Option<super::SavedFindState> {
         let raw = storage().and_then(|storage| storage.get_item(FIND_STATE_KEY).ok().flatten())?;
-        let (find, replace, regex, case_insensitive, replace_focused): (
+        let (find, replace, regex, case_insensitive, multi_line, replace_focused): (
             String,
             String,
+            bool,
             bool,
             bool,
             bool,
@@ -217,6 +219,7 @@ mod imp {
             replace,
             regex,
             case_insensitive,
+            multi_line,
             replace_focused,
         })
     }
@@ -228,6 +231,7 @@ mod imp {
             state.replace.as_str(),
             state.regex,
             state.case_insensitive,
+            state.multi_line,
             state.replace_focused,
         ))
         .map_err(|_| ())?;

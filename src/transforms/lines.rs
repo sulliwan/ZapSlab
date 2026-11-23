@@ -1,6 +1,6 @@
 //! Line-oriented transforms, ported from Boop's `Sort.js`, `NatSort.js`,
 //! `ReverseLines.js`, `ShuffleLines.js`, `RemoveDuplicates.js`, `Collapse.js`
-//! and `MarkdownQuote.js`.
+//! and `MarkdownQuote.js`, plus a local "Remove Empty Lines" entry.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -43,6 +43,13 @@ pub const TRANSFORMS: &[Transform] = &[
         tags: "unique,duplicate",
         scope: Scope::SelectionOrFullText,
         apply: remove_duplicate_lines,
+    },
+    Transform {
+        name: "Remove Empty Lines",
+        description: "Remove blank lines, including whitespace-only lines, and report how many were removed.",
+        tags: "empty,blank,whitespace,strip,delete,lines",
+        scope: Scope::SelectionOrFullText,
+        apply: remove_empty_lines,
     },
     Transform {
         name: "Collapse lines",
@@ -184,6 +191,17 @@ fn remove_duplicate_lines(input: &str) -> TransformResult {
     TransformResult::replace_and_report(unique.join("\n"), format!("{removed} lines removed"))
 }
 
+fn remove_empty_lines(input: &str) -> TransformResult {
+    let lines: Vec<&str> = input.split('\n').collect();
+    let kept: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let removed = lines.len() - kept.len();
+    TransformResult::replace_and_report(kept.join("\n"), format!("{removed} lines removed"))
+}
+
 fn collapse_lines(input: &str) -> TransformResult {
     let lines = split_any_newline(input);
     let collapsed = lines.join(",");
@@ -290,6 +308,26 @@ mod tests {
             }
             _ => panic!("expected TransformResult::ReplaceAndReport"),
         }
+    }
+
+    #[test]
+    fn remove_empty_lines_drops_blank_and_whitespace_only_lines() {
+        match remove_empty_lines("a\n\n  \nb\n\t\nc") {
+            TransformResult::ReplaceAndReport { text, message } => {
+                assert_eq!(text, "a\nb\nc");
+                assert_eq!(message, "3 lines removed");
+            }
+            _ => panic!("expected TransformResult::ReplaceAndReport"),
+        }
+    }
+
+    #[test]
+    fn remove_empty_lines_leaves_input_without_blanks_unchanged() {
+        assert!(matches!(
+            remove_empty_lines("a\nb"),
+            TransformResult::ReplaceAndReport { text, message }
+                if text == "a\nb" && message == "0 lines removed"
+        ));
     }
 
     #[test]

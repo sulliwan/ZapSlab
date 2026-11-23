@@ -32,11 +32,17 @@ WGPU_PATCHED := $(CACHE)/wgpu-patched
 WRANGLER_HOME_DIR := $(CURDIR)/.wrangler
 WRANGLER_CONFIG := $(CURDIR)/wrangler.toml
 
+# SELinux relabel suffix for bind mounts: empty when SELinux is absent/disabled,
+# ":Z" when it is enforcing. Keyed on the host rather than the runtime so
+# nerdctl/docker/podman each get the relabel they need, while non-SELinux
+# machines (e.g. the original nerdctl/docker laptop) keep the original mounts.
+SELINUX_RELABEL := $(shell if test -f /sys/fs/selinux/enforce && grep -qx 1 /sys/fs/selinux/enforce; then echo :Z; fi)
+
 # Runtime invocation: source mounted at /app, caches kept inside the project
 # (gitignored). This runtime maps container root to the invoking host user, so
 # files stay host-owned without a --user flag.
 RUN = $(RUNTIME) run --rm \
-	-v "$(CURDIR)":/app \
+	-v "$(CURDIR)":/app$(SELINUX_RELABEL) \
 	-w /app \
 	-e CARGO_HOME=/app/.cache/cargo \
 	-e HOME=/app/.cache/home \
@@ -47,9 +53,9 @@ RUN = $(RUNTIME) run --rm \
 # gitignored .wrangler/ directory so `wrangler login` credentials persist across
 # the disposable --rm containers. Authentication uses wrangler's OAuth device
 # flow (`wrangler login --device`), which needs no localhost callback and thus
-# works with rootless nerdctl where host networking is unavailable.
+# works with rootless podman/nerdctl where host networking is unavailable.
 DEPLOY_FLAGS = run --rm \
-	-v "$(CURDIR)":/app \
+	-v "$(CURDIR)":/app$(SELINUX_RELABEL) \
 	-w /app \
 	-e HOME=/app/.wrangler/home \
 	-e WRANGLER_SEND_METRICS=false
@@ -140,7 +146,7 @@ deploy: web deploy-image $(WRANGLER_HOME_DIR)
 
 shell: $(CARGO_HOME_DIR) $(HOME_DIR)
 	$(RUNTIME) run --rm -it \
-		-v "$(CURDIR)":/app \
+		-v "$(CURDIR)":/app$(SELINUX_RELABEL) \
 		-w /app \
 		-e CARGO_HOME=/app/.cache/cargo \
 		-e HOME=/app/.cache/home \

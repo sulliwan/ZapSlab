@@ -20,9 +20,11 @@ mod json;
 mod lines;
 mod numbers;
 mod platform;
+mod punycode;
 pub(crate) mod random;
 mod stats;
 mod text;
+mod unicode;
 
 use std::{collections::HashMap, sync::LazyLock};
 
@@ -91,6 +93,7 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
     let mut all = Vec::new();
     all.extend_from_slice(case::TRANSFORMS);
     all.extend_from_slice(encoding::TRANSFORMS);
+    all.extend_from_slice(punycode::TRANSFORMS);
     all.extend_from_slice(numbers::TRANSFORMS);
     all.extend_from_slice(hashing::TRANSFORMS);
     all.extend_from_slice(json::TRANSFORMS);
@@ -98,6 +101,7 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
     all.extend_from_slice(lines::TRANSFORMS);
     all.extend_from_slice(stats::TRANSFORMS);
     all.extend_from_slice(text::TRANSFORMS);
+    all.extend_from_slice(unicode::TRANSFORMS);
     all.extend_from_slice(dates::TRANSFORMS);
     all.extend_from_slice(platform::TRANSFORMS);
     all.extend_from_slice(color::TRANSFORMS);
