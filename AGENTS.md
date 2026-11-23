@@ -68,6 +68,17 @@ dependency set. Keep `crates/document` free of `regex`.
 All root-crate builds run inside the pinned builder image. The host only needs
 `make` and a container runtime (`nerdctl`, `docker`, or `podman`).
 
+**Container targets must run outside the Zed agent sandbox.** The default
+terminal sandbox mounts `/run/user/$UID` read-only, so rootless Podman cannot
+create its runtime directory and fails with
+`mkdir /run/user/1000/libpod: read-only file system`. Run `make` from a normal
+shell, or have the agent run it with the terminal sandbox disabled. The
+Makefile picks the runtime with `RUNTIME ?=` (`nerdctl` → `docker` → `podman`;
+override with e.g. `make check RUNTIME=podman`) and, on SELinux-enforcing hosts,
+appends `:Z` to the bind mounts via `SELINUX_RELABEL` (gated on
+`/sys/fs/selinux/enforce`). The suffix is empty on non-SELinux machines, so
+nerdctl/docker hosts keep the original mount flags.
+
 ```sh
 make image       # build the builder image (docker/Dockerfile)
 make check       # cargo check --target wasm32-unknown-unknown (fast feedback)
@@ -84,6 +95,22 @@ make bump_version major|minor|revision  # bump [package].version in Cargo.toml (
 make vendor-wgpu # materialize the patched wgpu source
 make clean       # remove target/, dist/, .cache/
 ```
+
+**When to use which target.** Every root-crate operation goes through `make`
+(never a host `cargo` invocation — see the first rule below). Quick mapping:
+
+- `make image` — first checkout, or after editing `docker/Dockerfile*`.
+- `make check` — type-check the root crate after a Rust edit (fastest feedback).
+- `make test` — logic change in `crates/document`.
+- `make web` — produce the deployable PWA bundle (`make wasm` for the wasm
+  binary only).
+- `make serve` — build `web`, then serve `dist/` at <http://localhost:8119>.
+- `make deploy` — publish to Cloudflare Pages (builds images / logs in as
+  needed).
+- `make bump_version major|minor|revision` — bump the app version.
+- `make icons` — re-render the PWA icons from the source artwork.
+- `make shell` — inspect or run commands inside the builder image.
+- `make clean` — remove `target/`, `dist/`, and `.cache/`.
 
 Rules:
 
@@ -102,7 +129,7 @@ Rules:
   `cargo check --tests --target wasm32-unknown-unknown`; to actually run those
   tests, use a standalone crate that path-includes `src/transforms/mod.rs`.
 - **Deployment uses `wrangler login --device` (OAuth device authorization),
-  not the localhost callback flow.** Rootless nerdctl cannot expose a
+  not the localhost callback flow.** Rootless nerdctl/podman cannot expose a
   container's loopback listener to the host browser, so port publishing and
   host networking are not an option; the device flow needs neither. Login state
   lives in the gitignored `.wrangler/` (deliberately outside `.cache/`, so
