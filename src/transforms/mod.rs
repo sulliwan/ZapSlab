@@ -20,6 +20,7 @@ mod json;
 mod lines;
 mod numbers;
 mod platform;
+mod punycode;
 pub(crate) mod random;
 mod stats;
 mod text;
@@ -91,6 +92,7 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
     let mut all = Vec::new();
     all.extend_from_slice(case::TRANSFORMS);
     all.extend_from_slice(encoding::TRANSFORMS);
+    all.extend_from_slice(punycode::TRANSFORMS);
     all.extend_from_slice(numbers::TRANSFORMS);
     all.extend_from_slice(hashing::TRANSFORMS);
     all.extend_from_slice(json::TRANSFORMS);

@@ -43,11 +43,12 @@ use zapslab_document::{
     Document, LineEnding, MAX_DOCUMENT_BYTES, byte_offset_for_utf16, display,
     display::DisplayOptions,
     encoding::{self, Encoding},
+    find,
     hexdump::HexIndex,
     utf16_offset,
 };
 
-use crate::{commands, find, storage, transforms, version};
+use crate::{commands, storage, transforms, version};
 
 mod view;
 
@@ -247,9 +248,10 @@ pub(crate) enum FindField {
 
 /// Floating find/replace dialog state.
 ///
-/// `matcher` and `current` are derived from `find`/`regex`/`case_insensitive`
-/// and rebuilt by `refresh_find` on every query change, never per frame.
-/// `error` holds a regex compile failure so the dialog can show it inline.
+/// `matcher` and `current` are derived from the query flags below and rebuilt
+/// by `refresh_find` on every query change, never per frame. `error` holds a
+/// user-facing message (a regex compile failure or a runtime "too complex"
+/// failure) so the dialog can show it inline.
 struct FindState {
     find: String,
     replace: String,
@@ -270,6 +272,8 @@ struct FindState {
     field: FindField,
     regex: bool,
     case_insensitive: bool,
+    /// Regex `m` flag: `^`/`$` match at line boundaries. Ignored in literal mode.
+    multi_line: bool,
     matcher: Option<find::Matcher>,
     error: Option<String>,
     current: Option<(usize, usize)>,

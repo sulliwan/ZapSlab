@@ -36,19 +36,25 @@ impl Scratchpad {
             None => None,
         };
 
-        let (find, replace, regex, case_insensitive, field, select_find) =
+        let (find, replace, regex, case_insensitive, multi_line, field, select_find) =
             match (seed, self.last_find.clone()) {
                 // A live selection always becomes the find query, fully selected.
                 (Some(find), saved) => {
-                    let (replace, regex, case_insensitive) = match saved {
-                        Some(saved) => (saved.replace, saved.regex, saved.case_insensitive),
-                        None => (String::new(), false, false),
+                    let (replace, regex, case_insensitive, multi_line) = match saved {
+                        Some(saved) => (
+                            saved.replace,
+                            saved.regex,
+                            saved.case_insensitive,
+                            saved.multi_line,
+                        ),
+                        None => (String::new(), false, false, false),
                     };
                     (
                         find,
                         replace,
                         regex,
                         case_insensitive,
+                        multi_line,
                         FindField::Find,
                         true,
                     )
@@ -59,6 +65,7 @@ impl Scratchpad {
                     saved.replace,
                     saved.regex,
                     saved.case_insensitive,
+                    saved.multi_line,
                     if saved.replace_focused {
                         FindField::Replace
                     } else {
@@ -69,6 +76,7 @@ impl Scratchpad {
                 (None, None) => (
                     String::new(),
                     String::new(),
+                    false,
                     false,
                     false,
                     FindField::Find,
@@ -90,6 +98,7 @@ impl Scratchpad {
             field,
             regex,
             case_insensitive,
+            multi_line,
             matcher: None,
             error: None,
             current: None,
@@ -141,6 +150,7 @@ impl Scratchpad {
             replace: state.replace.clone(),
             regex: state.regex,
             case_insensitive: state.case_insensitive,
+            multi_line: state.multi_line,
             replace_focused: state.field == FindField::Replace,
         });
         if let Some(saved) = saved {
@@ -391,6 +401,16 @@ impl Scratchpad {
             return;
         };
         state.case_insensitive = !state.case_insensitive;
+        self.after_find_query_changed(cx);
+    }
+
+    /// Toggles the regex `m` flag so `^`/`$` match line boundaries. It only
+    /// affects regex queries; literal queries are escaped and unaffected.
+    pub(crate) fn toggle_find_multiline(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.find else {
+            return;
+        };
+        state.multi_line = !state.multi_line;
         self.after_find_query_changed(cx);
     }
 
@@ -738,29 +758,52 @@ impl Scratchpad {
         cx.notify();
     }
 
+    /// Surfaces a runtime regex failure in the dialog status line, clearing
+    /// the stale current match.
+    fn report_find_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.find {
+            state.current = None;
+            state.wrapped = false;
+            state.error = Some(message);
+        }
+        cx.notify();
+    }
+
     /// Recompiles the query and recomputes the current match at or after
     /// `from`, wrapping to the top. Called on query changes and on open, never
     /// per frame.
     pub(crate) fn refresh_find(&mut self, from: usize) {
-        let Some((query, is_regex, case_insensitive)) = self
-            .find
-            .as_ref()
-            .map(|state| (state.find.clone(), state.regex, state.case_insensitive))
+        let Some((query, is_regex, case_insensitive, multi_line)) =
+            self.find.as_ref().map(|state| {
+                (
+                    state.find.clone(),
+                    state.regex,
+                    state.case_insensitive,
+                    state.multi_line,
+                )
+            })
         else {
             return;
         };
 
-        let compiled = find::compile(&query, is_regex, case_insensitive);
+        let compiled = find::compile(&query, is_regex, case_insensitive, multi_line);
         let (matcher, error, current) = match compiled {
             Ok(Some(matcher)) => {
                 let text = self.document.text();
                 let from = from.min(text.len());
-                let current = find::find_next(text, &matcher, from)
-                    .or_else(|| find::find_next(text, &matcher, 0));
-                (Some(matcher), None, current)
+                // Search from the requested offset, wrapping to the top.
+                let (current, error) = match find::find_next(text, &matcher, from) {
+                    Ok(Some(range)) => (Some(range), None),
+                    Ok(None) => match find::find_next(text, &matcher, 0) {
+                        Ok(next) => (next, None),
+                        Err(message) => (None, Some(message)),
+                    },
+                    Err(message) => (None, Some(message)),
+                };
+                (Some(matcher), error, current)
             }
             Ok(None) => (None, None, None),
-            Err(message) => (None, Some(message), None),
+            Err(message) => (None, Some(format!("Invalid regex: {message}")), None),
         };
 
         if let Some(state) = &mut self.find {
@@ -773,7 +816,7 @@ impl Scratchpad {
 
     pub(crate) fn find_next_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.record_find();
-        let (next, wrapped) = {
+        let outcome = {
             let Some(state) = self.find.as_ref() else {
                 return;
             };
@@ -786,12 +829,22 @@ impl Scratchpad {
                 .unwrap_or(self.document.cursor());
             let text = self.document.text();
             match find::find_next(text, matcher, from) {
-                Some(range) => (Some(range), false),
-                None => (find::find_next(text, matcher, 0), true),
+                Ok(Some(range)) => Ok((Some(range), false)),
+                Ok(None) => find::find_next(text, matcher, 0).map(|next| (next, true)),
+                Err(message) => Err(message),
+            }
+        };
+
+        let (next, wrapped) = match outcome {
+            Ok(found) => found,
+            Err(message) => {
+                self.report_find_error(message, cx);
+                return;
             }
         };
 
         if let Some(state) = &mut self.find {
+            state.error = None;
             state.current = next;
             state.wrapped = wrapped && next.is_some();
         }
@@ -803,7 +856,7 @@ impl Scratchpad {
 
     pub(crate) fn find_prev_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.record_find();
-        let (previous, wrapped) = {
+        let outcome = {
             let Some(state) = self.find.as_ref() else {
                 return;
             };
@@ -816,12 +869,24 @@ impl Scratchpad {
                 .unwrap_or(self.document.cursor());
             let text = self.document.text();
             match find::find_prev(text, matcher, before) {
-                Some(range) => (Some(range), false),
-                None => (find::find_prev(text, matcher, text.len()), true),
+                Ok(Some(range)) => Ok((Some(range), false)),
+                Ok(None) => {
+                    find::find_prev(text, matcher, text.len()).map(|previous| (previous, true))
+                }
+                Err(message) => Err(message),
+            }
+        };
+
+        let (previous, wrapped) = match outcome {
+            Ok(found) => found,
+            Err(message) => {
+                self.report_find_error(message, cx);
+                return;
             }
         };
 
         if let Some(state) = &mut self.find {
+            state.error = None;
             state.current = previous;
             state.wrapped = wrapped && previous.is_some();
         }
@@ -882,6 +947,13 @@ impl Scratchpad {
             };
             find::replacement_for(self.document.text(), matcher, range, &state.replace)
         };
+        let replacement = match replacement {
+            Ok(replacement) => replacement,
+            Err(message) => {
+                self.report_find_error(message, cx);
+                return;
+            }
+        };
 
         if self.replace_range(range.0, range.1, &replacement, window, cx) {
             // The match offsets are stale after the edit; re-find from the end
@@ -923,15 +995,19 @@ impl Scratchpad {
         };
 
         let new_text = match outcome {
-            find::ReplaceAll::OverLimit => {
+            Err(message) => {
+                self.report_find_error(message, cx);
+                return;
+            }
+            Ok(find::ReplaceAll::OverLimit) => {
                 self.show_hint("Document limit reached (64 MB).", cx);
                 return;
             }
-            find::ReplaceAll::Unchanged => {
+            Ok(find::ReplaceAll::Unchanged) => {
                 self.show_hint("No matches", cx);
                 return;
             }
-            find::ReplaceAll::Replaced(text) => text,
+            Ok(find::ReplaceAll::Replaced(text)) => text,
         };
         // A replacement that yields identical bytes is a no-op; `replace_range`
         // reports it as unchanged, so treat it as "No matches" for the user.
@@ -948,6 +1024,7 @@ impl Scratchpad {
             if let Some(state) = &mut self.find {
                 state.current = None;
                 state.wrapped = false;
+                state.error = None;
             }
             window.notify_text_selection_changed(&self.focus_handle);
             cx.notify();
@@ -975,7 +1052,7 @@ impl Scratchpad {
             let recent_finds = self.recent_finds.clone();
 
             let (status_text, status_color) = if let Some(error) = &state.error {
-                (format!("Invalid regex: {error}"), rgb(0xf38ba8))
+                (error.clone(), rgb(0xf38ba8))
             } else if state.matcher.is_none() {
                 (String::new(), rgb(0x6c7086))
             } else if state.current.is_none() {
@@ -1274,6 +1351,30 @@ impl Scratchpad {
                 }))
                 .child(".*");
 
+            // `M` toggles the regex `m` flag (line-anchored `^`/`$`). It is
+            // only meaningful for regex queries, so it is shown only then.
+            let multiline_toggle = div()
+                .ml(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .text_size(px(12.0))
+                .text_color(if state.multi_line {
+                    rgb(0x11111b)
+                } else {
+                    rgb(0xa6adc8)
+                })
+                .bg(if state.multi_line {
+                    rgb(0x94e2d5)
+                } else {
+                    rgb(0x313244)
+                })
+                .id("find-multiline-toggle")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_find_multiline(cx);
+                }))
+                .child("M");
+
             let case_toggle = div()
                 .ml(px(6.0))
                 .px(px(6.0))
@@ -1414,6 +1515,11 @@ impl Scratchpad {
                                 )
                                 .child(find_field)
                                 .child(regex_toggle)
+                                .children(if state.regex {
+                                    Some(multiline_toggle)
+                                } else {
+                                    None
+                                })
                                 .child(case_toggle),
                         )
                         .child(

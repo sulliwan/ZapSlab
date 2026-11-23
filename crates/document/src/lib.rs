@@ -1,10 +1,11 @@
 //! Pure document model for ZapSlab.
 //!
-//! Everything here is plain `std`: text, the byte-offset cursor/anchor, the
-//! incremental line index, the bounded undo/redo history, and the UTF-16 ⇄ byte
-//! offset conversion used at the platform input boundary. There are no `gpui`,
-//! `wasm-bindgen`, or `web-sys` imports, so the whole model is unit-testable
-//! offline with `cargo test`.
+//! Everything here is pure Rust: text, the byte-offset cursor/anchor, the
+//! incremental line index, the bounded undo/redo history, the UTF-16 ⇄ byte
+//! offset conversion used at the platform input boundary, and the find/replace
+//! engine. The only dependencies are pure-Rust crates (Unicode helpers and
+//! `fancy-regex`); there are no `gpui`, `wasm-bindgen`, or `web-sys` imports, so
+//! the whole model is unit-testable offline with `cargo test`.
 //!
 //! Invariants:
 //! - `text` never contains `\r`; CRLF/CR is normalized on the way in.
@@ -17,6 +18,7 @@
 pub mod display;
 pub mod encoding;
 pub mod escape;
+pub mod find;
 pub mod grapheme;
 pub mod hexdump;
 

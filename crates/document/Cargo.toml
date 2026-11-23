@@ -6,8 +6,8 @@ publish = false
 
 # Declaring an (empty) workspace makes this crate its own workspace root, so it
 # is built and tested independently of the gpui editor package. Its dependencies
-# are pure-Rust Unicode crates (no gpui/wasm), so `cargo test` stays offline and
-# fast to compile.
+# are pure-Rust crates (no gpui/wasm), so `cargo test` stays offline and fast to
+# compile.
 [workspace]
 
 [dependencies]
@@ -15,3 +15,6 @@ publish = false
 unicode-segmentation = "=1.13.3"
 # General_Category lookups for deciding which characters are invisible.
 unicode-properties = "=0.1.3"
+# Find/replace engine: look-around, backreferences, and Unicode case folding.
+# Pure Rust and wasm-compatible (it delegates simple patterns to `regex`).
+fancy-regex = "=0.20.2"

@@ -416,12 +416,27 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec 0.8.0",
+]
+
+[[package]]
+name = "bit-set"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56d87354e4229f54a44f7bf2435906a4656dba36026ab6eaca629a2c436a691c"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.10.2",
 ]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bit-vec"
@@ -1166,6 +1181,17 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2620,7 +2646,7 @@ name = "naga"
 version = "30.0.0"
 dependencies = [
  "arrayvec",
- "bit-set",
+ "bit-set 0.11.1",
  "bitflags 2.13.2",
  "cfg-if",
  "cfg_aliases",
@@ -4942,8 +4968,8 @@ name = "wgpu-core"
 version = "30.0.0"
 dependencies = [
  "arrayvec",
- "bit-set",
- "bit-vec",
+ "bit-set 0.11.1",
+ "bit-vec 0.10.2",
  "bitflags 2.13.2",
  "bytemuck",
  "cfg_aliases",
@@ -5013,7 +5039,7 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
- "bit-set",
+ "bit-set 0.11.1",
  "bitflags 2.13.2",
  "block2 0.6.2",
  "bytemuck",
@@ -5410,7 +5436,6 @@ dependencies = [
  "js-sys",
  "md-5",
  "percent-encoding",
- "regex",
  "serde_json",
  "serde_yaml_ng",
  "sha1_smol",
@@ -5428,6 +5453,7 @@ dependencies = [
 name = "zapslab-document"
 version = "0.1.0"
 dependencies = [
+ "fancy-regex",
  "unicode-properties",
  "unicode-segmentation",
 ]
