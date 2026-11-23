@@ -26,6 +26,7 @@ serde_yaml_ng = "0.10"
 sha1_smol = "1"
 sha2 = "0.10"
 sqlformat = "0.5"
+unicode-normalization = "0.1"
 unicode-segmentation = "1"
 xmltree = "0.12"
 zapslab-document = { path = "crates/document" }

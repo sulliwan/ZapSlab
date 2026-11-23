@@ -24,6 +24,7 @@ mod punycode;
 pub(crate) mod random;
 mod stats;
 mod text;
+mod unicode;
 
 use std::{collections::HashMap, sync::LazyLock};
 
@@ -100,6 +101,7 @@ pub static TRANSFORMS: LazyLock<Vec<Transform>> = LazyLock::new(|| {
     all.extend_from_slice(lines::TRANSFORMS);
     all.extend_from_slice(stats::TRANSFORMS);
     all.extend_from_slice(text::TRANSFORMS);
+    all.extend_from_slice(unicode::TRANSFORMS);
     all.extend_from_slice(dates::TRANSFORMS);
     all.extend_from_slice(platform::TRANSFORMS);
     all.extend_from_slice(color::TRANSFORMS);
